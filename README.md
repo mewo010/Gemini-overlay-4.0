@@ -1,50 +1,32 @@
-# AI Overlay for Windows
+# AI Overlay — automatic Windows build and GitHub Releases
 
-This repository builds `ai_overlay.py` into a single Windows executable using GitHub Actions.
+Every push to the `main` branch automatically builds `AI-Overlay.exe` on a Windows GitHub Actions runner and creates a GitHub Release with the executable attached. You can also start the workflow manually from the **Actions** tab.
 
-## Files
+## What the workflow does
 
-- `ai_overlay.py` — the application source.
-- `requirements.txt` — Python packages used by the application and the packager.
-- `.github/workflows/build-release.yml` — builds the EXE and publishes it to GitHub Releases when you push a version tag.
+- Builds a single-file Windows executable with PyInstaller.
+- Uploads the EXE as an Actions artifact (retained for 30 days).
+- Creates a release with a version like `v1.0.12` and title `AI-Overlay v1.0.12`.
+- Uses GitHub-generated release notes for the release description.
+- Attaches `AI-Overlay.exe` to the release so people can download it from **Releases**.
 
-## Upload the project to GitHub
+The patch number comes from the GitHub Actions run number, so each new workflow run gets a new version tag. The workflow creates the release itself; you do not need to push a version tag manually.
 
-1. Create a new GitHub repository.
-2. Upload these files while keeping the `.github/workflows/` folder path exactly as shown.
-3. Commit and push the files to the repository's default branch.
+## Repository setup
 
-## Build an EXE without publishing a Release
+1. Put `ai_overlay.py`, `requirements.txt`, `.gitignore`, `README.md`, and `.github/workflows/build-release.yml` in the root of your GitHub repository. Keep the `.github` folder and workflow filename exactly as shown.
+2. Make sure the default branch is named `main`. If your branch is named `master` or something else, update the branch under `on.push.branches` in the workflow.
+3. In GitHub, open **Settings → Actions → General → Workflow permissions** and enable **Read and write permissions** if organization/repository policy allows it. The workflow declares `contents: write` to let `GITHUB_TOKEN` create releases.
+4. Commit and push the workflow to `main`.
+5. Every subsequent push to `main` starts a build and publishes a release automatically. To start one manually, use **Actions → Build Windows EXE and Publish Release → Run workflow**.
 
-1. Open the repository on GitHub.
-2. Select **Actions**.
-3. Select **Build Windows EXE and Release**.
-4. Click **Run workflow**.
-5. When it finishes, open that run and download the `AI-Overlay-Windows` artifact.
+## Versioning note
 
-Manual workflow runs create an Actions artifact only. They do not publish a Release.
-
-## Publish an EXE in the repository's Releases tab
-
-From a terminal in the repository folder, run:
-
-```bash
-git add .
-git commit -m "Set up Windows EXE build"
-git push
-git tag v1.0.0
-git push origin v1.0.0
-```
-
-Pushing a tag whose name starts with `v` starts the workflow. When it succeeds, open the repository's **Releases** tab and select the release for `v1.0.0`. The `AI-Overlay.exe` file will be attached to that release.
-
-For a later version, use a new tag such as `v1.0.1`. Git tags must be unique.
+The version is `v1.0.<GitHub Actions run number>`. Since run numbers count workflow runs, versions may skip numbers if a run fails before publishing; a failed run can be rerun, but a release that was already created under that tag should not be recreated. If you want strict semantic versioning (major/minor/patch based on a version file), this workflow can be adapted for that.
 
 ## Important notes
 
-- GitHub Actions builds this on a Windows runner; the resulting EXE is for Windows, not macOS or Linux.
-- The app uses microphone/audio, global hotkeys, screen capture and optional mouse/keyboard automation. Windows may show permission, security or antivirus warnings for newly built executables.
-- API keys are configured inside the app's Settings; do not commit real API keys to GitHub.
-- On first launch, configure a provider in Settings. Internet-based providers may require their own API key.
-- The app writes `config.json`, `memory.json` and `vault.bin` beside the EXE. Put the EXE in a folder where your Windows user has write permission (for example, a folder under your user profile), rather than a protected system folder.
-- This workflow does not sign the executable. Windows SmartScreen may warn about an unsigned EXE.
+- This builds a Windows executable using `windows-latest`; it does not build a macOS or Linux executable.
+- Do not commit API keys, passwords, or private configuration.
+- The app may store its configuration, memory, or vault files beside the executable; place it in a folder where you have write permission.
+- The executable is not code-signed, so Windows SmartScreen may show a warning.
