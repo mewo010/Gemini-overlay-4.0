@@ -1,17 +1,17 @@
 
-name: Build Windows EXE and Release
+name: Build Windows EXE and Publish Release
 
 on:
   push:
-    tags:
-      - "v*"
+    branches:
+      - main
   workflow_dispatch:
 
 permissions:
   contents: write
 
 jobs:
-  build-windows:
+  build-and-release:
     runs-on: windows-latest
 
     steps:
@@ -31,15 +31,15 @@ jobs:
           python -m pip install -r requirements.txt
 
       - name: Build Windows EXE
-        run: |
-          python -m PyInstaller `
-            --noconfirm `
-            --clean `
-            --onefile `
-            --windowed `
-            --name AI-Overlay `
-            --collect-all sounddevice `
-            ai_overlay.py
+        run: >-
+          python -m PyInstaller
+          --noconfirm
+          --clean
+          --onefile
+          --windowed
+          --name AI-Overlay
+          --collect-all sounddevice
+          ai_overlay.py
 
       - name: Upload EXE artifact
         uses: actions/upload-artifact@v4
@@ -49,9 +49,16 @@ jobs:
           if-no-files-found: error
           retention-days: 30
 
-      - name: Publish GitHub Release
-        if: startsWith(github.ref, 'refs/tags/')
-        uses: softprops/action-gh-release@v2
-        with:
-          generate_release_notes: true
-          files: dist/AI-Overlay.exe
+      - name: Create GitHub Release
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          GH_REPO: ${{ github.repository }}
+          RUN_NUMBER: ${{ github.run_number }}
+        shell: bash
+        run: |
+          TAG="v1.0.${RUN_NUMBER}"
+          TITLE="AI-Overlay ${TAG}"
+
+          gh release create "$TAG" dist/AI-Overlay.exe \
+            --title "$TITLE" \
+            --generate-notes
