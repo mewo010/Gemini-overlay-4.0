@@ -1,0 +1,8 @@
+PyQt6
+requests
+keyboard
+sounddevice
+numpy
+pyautogui
+cryptography
+pyinstaller
