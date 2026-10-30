@@ -1,0 +1,44 @@
+# Save as: .github/workflows/discord-release.yml
+# Needs a repo secret named DISCORD_WEBHOOK (Settings > Secrets and variables > Actions).
+name: Discord release announcement
+
+on:
+  release:
+    types: [published]        # fires when you publish a release (drafts don't trigger it)
+
+jobs:
+  notify:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Send embed to Discord
+        env:
+          WEBHOOK: ${{ secrets.DISCORD_WEBHOOK }}
+          TAG: ${{ github.event.release.tag_name }}
+          BODY: ${{ github.event.release.body }}
+          RELEASE_URL: ${{ github.event.release.html_url }}
+          SITE: https://YOUR-NAME.pages.dev        # <- change to your site
+          PRE: ${{ github.event.release.prerelease }}
+        run: |
+          [ "$PRE" = "true" ] && TITLE="🧪 Pre-release: $TAG" || TITLE="🚀 New update: $TAG"
+          jq -n \
+            --arg title "$TITLE" \
+            --arg body "${BODY:0:900}" \
+            --arg site "$SITE" \
+            --arg rel "$RELEASE_URL" \
+            --arg tag "$TAG" \
+            '{
+              username: "AI Overlay Updates",
+              embeds: [{
+                title: $title,
+                url: $site,
+                description: (if $body == "" then "Bug fixes and improvements." else $body end),
+                color: 3890139,
+                fields: [
+                  {name: "⬇️ Download", value: "[Get the latest version](\($site))", inline: true},
+                  {name: "📝 Release notes", value: "[View on GitHub](\($rel))", inline: true},
+                  {name: "Version", value: $tag, inline: true}
+                ],
+                footer: {text: "AI Overlay"},
+                timestamp: (now | todate)
+              }]
+            }' | curl -sS --fail -H "Content-Type: application/json" -d @- "$WEBHOOK"
