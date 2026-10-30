@@ -16,7 +16,7 @@ jobs:
           TAG: ${{ github.event.release.tag_name }}
           BODY: ${{ github.event.release.body }}
           RELEASE_URL: ${{ github.event.release.html_url }}
-          SITE: https://YOUR-NAME.pages.dev        # <- change to your site
+          SITE: https://getaioverlay.pages.dev/        # <- change to your site
           PRE: ${{ github.event.release.prerelease }}
         run: |
           [ "$PRE" = "true" ] && TITLE="🧪 Pre-release: $TAG" || TITLE="🚀 New update: $TAG"
