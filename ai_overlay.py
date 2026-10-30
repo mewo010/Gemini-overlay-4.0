@@ -20,6 +20,10 @@ Emergency stop for any automation: Ctrl+Alt+X (rebindable) or fling the mouse in
 import sys, os, io, re, ast, copy, json, wave, time, math, queue, base64, threading, subprocess, webbrowser
 import urllib.parse
 import requests, keyboard, numpy as np, sounddevice as sd
+if sys.platform == "win32":     # must run before pyautogui/Qt: per-monitor DPI keeps coordinates right on mixed-DPI multi-monitor setups
+    try:
+        import ctypes; ctypes.windll.user32.SetProcessDpiAwarenessContext(ctypes.c_void_p(-4))
+    except Exception: pass
 try:
     import pyautogui
     pyautogui.FAILSAFE = True; pyautogui.PAUSE = 0.03
@@ -31,19 +35,21 @@ try:
 except Exception:
     Fernet = None
 from PyQt6.QtCore import (Qt, QRect, QRectF, QTimer, QObject, pyqtSignal, QPropertyAnimation,
-                          QParallelAnimationGroup, QEasingCurve, QBuffer, QByteArray, QPointF)
+                          QParallelAnimationGroup, QEasingCurve, QBuffer, QByteArray, QPointF, QEvent)
 from PyQt6.QtGui import (QPainter, QColor, QPen, QCursor, QGuiApplication, QRadialGradient, QConicalGradient,
-                         QIcon, QPixmap, QAction, QFont, QPolygonF, QPainterPath, QImage)
+                         QIcon, QPixmap, QAction, QFont, QPolygonF, QPainterPath, QImage, QKeySequence)
 from PyQt6.QtWidgets import (QApplication, QWidget, QFrame, QVBoxLayout, QHBoxLayout, QLabel, QPushButton,
                              QLineEdit, QTextBrowser, QGraphicsDropShadowEffect, QSystemTrayIcon, QMenu,
                              QDialog, QFormLayout, QComboBox, QDoubleSpinBox, QSpinBox, QMessageBox,
-                             QTabWidget, QListWidget, QCheckBox, QInputDialog, QFileDialog)
+                             QTabWidget, QListWidget, QCheckBox, QInputDialog, QFileDialog, QScrollArea, QStackedWidget,
+                             QListWidgetItem, QProgressBar)
 
 FROZEN = getattr(sys, "frozen", False)
 BASE = os.path.dirname(sys.executable) if FROZEN else os.path.dirname(os.path.abspath(__file__))
 CFG_PATH = os.path.join(BASE, "config.json")
 BUNDLED_CFG = os.path.join(getattr(sys, "_MEIPASS", BASE), "config.json")
 MEM_PATH = os.path.join(BASE, "memory.json")
+USAGE_PATH = os.path.join(BASE, "usage.json")
 VAULT_PATH = os.path.join(BASE, "vault.bin")
 NO_WINDOW = getattr(subprocess, "CREATE_NO_WINDOW", 0)
 
@@ -52,7 +58,7 @@ PRESETS = {   # {effort} is replaced with the "Thinking effort" setting at reque
     "OpenRouter": dict(url="https://openrouter.ai/api/v1/chat/completions", model="google/gemini-3.5-flash",
                        extra={"reasoning": {"effort": "{effort}"}, "provider": {"sort": "latency"}}, vision=True, audio=True),
     "Gemini": dict(url="https://generativelanguage.googleapis.com/v1beta/openai/chat/completions", model="gemini-3.5-flash",
-                   extra={"reasoning_effort": "{effort}"}, vision=True, audio=True),
+                   extra={"reasoning_effort": "{effort}"}, vision=True, audio=True, daily_limit=250),   # daily_limit = editable estimate of the free quota
     "OpenAI": dict(url="https://api.openai.com/v1/chat/completions", model="gpt-4o-mini", extra={}, vision=True, audio=False),
     "Groq": dict(url="https://api.groq.com/openai/v1/chat/completions", model="llama-3.3-70b-versatile", extra={}, vision=False, audio=False),
     "Ollama (local)": dict(url="http://localhost:11434/v1/chat/completions", model="llama3.2", extra={}, vision=False, audio=False),
@@ -75,6 +81,7 @@ DEFAULTS = {
     "tts_provider": "elevenlabs",    # off | elevenlabs | openai
     "tts_key": "", "tts_voice": "21m00Tcm4TlvDq8ikWAM", "tts_model": "eleven_flash_v2_5",
     "tts_url": "https://api.openai.com/v1/audio/speech",
+    "display": "cursor",             # which monitor the overlay opens on: cursor | primary | name:<screen name>
     "muted": False,
     "stt_mode": "native",            # native = send audio to the model | transcribe = Whisper-style API first
     "stt_url": "https://api.groq.com/openai/v1/audio/transcriptions", "stt_key": "", "stt_model": "whisper-large-v3-turbo",
@@ -286,6 +293,26 @@ class Memory:
         with s.lock:
             if 0 <= i < len(s.items): del s.items[i]; s._save()
 
+    def edit(s, i, text):
+        text = " ".join(text.split())[:300]
+        if not text: return False, "nothing to save"
+        if SECRET_RE.search(text): return False, "refused: that looks sensitive. Use the secure vault for secrets"
+        with s.lock:
+            if not 0 <= i < len(s.items): return False, "item no longer exists"
+            s.items[i]["text"] = text; s._save()
+        return True, "updated"
+
+    def clear(s):
+        with s.lock: s.items = []; s._save()
+
+    def export(s, path):
+        with s.lock: json.dump(s.items, open(path, "w", encoding="utf-8"), indent=1, ensure_ascii=False)
+
+    def stats(s, limit=3000):
+        """(total items, items that fit in the prompt budget, characters used, budget)."""
+        inc = [ln for ln in s.prompt(limit).split("\n") if ln]
+        return len(s.items), len(inc), len("\n".join(inc)), limit
+
     def prompt(s, limit=3000):
         lines = [f"- {i['text']}" for i in s.items]; out = []; n = 0
         for ln in reversed(lines):                 # newest first, until the budget is used
@@ -293,6 +320,67 @@ class Memory:
             if n > limit: break
             out.append(ln)
         return "\n".join(reversed(out))
+
+
+# ---------- provider usage (who answered / how much is left today) ----------
+class Usage:
+    """Per-provider request counter that resets daily. Groq also reports the real remaining quota in response headers;
+    for other providers 'left' = the daily limit you set in the provider dialog minus today's count."""
+    def __init__(s, path):
+        s.path = path; s.lock = threading.Lock()
+        try: s.d = json.load(open(path, encoding="utf-8"))
+        except Exception: s.d = {}
+
+    @staticmethod
+    def key(p): return f"{p['name']}|{p['model']}"
+
+    @staticmethod
+    def today(p):   # Gemini's daily quota resets at midnight Pacific (approximated as UTC-8); everything else: UTC
+        off = -8 * 3600 if "generativelanguage" in p.get("url", "") else 0
+        return time.strftime("%Y-%m-%d", time.gmtime(time.time() + off))
+
+    def _e(s, p):
+        k, day = s.key(p), s.today(p); e = s.d.get(k)
+        if not e or e.get("day") != day: e = s.d[k] = {"day": day, "count": 0}
+        return e
+
+    def _save(s):
+        try:
+            tmp = s.path + ".tmp"; json.dump(s.d, open(tmp, "w", encoding="utf-8")); os.replace(tmp, s.path)
+        except Exception: pass
+
+    def rec(s, p, headers=None):
+        with s.lock:
+            e = s._e(p); e["count"] += 1; e.pop("exhausted", None)
+            if "groq.com" in p.get("url", "") and headers is not None:
+                for hk, ek in (("x-ratelimit-remaining-requests", "hdr_rem"), ("x-ratelimit-limit-requests", "hdr_lim")):
+                    try: e[ek] = int(float(headers.get(hk)))
+                    except (TypeError, ValueError): pass
+            s._save()
+
+    def limited(s, p, body):
+        if re.search(r"per ?day|daily|\bRPD\b", body or "", re.I):
+            with s.lock: s._e(p)["exhausted"] = True; s._save()
+
+    def left(s, p):
+        """(used today, remaining or None if unknown, limit or None)"""
+        with s.lock:
+            e = s._e(p); used = e["count"]; lim = int(p.get("daily_limit") or 0)
+            if e.get("exhausted"): return used, 0, lim or e.get("hdr_lim")
+            if "hdr_rem" in e: return used, e["hdr_rem"], e.get("hdr_lim")
+            return used, (max(0, lim - used) if lim else None), (lim or None)
+
+    def line(s, p):
+        used, rem, lim = s.left(p)
+        if rem is None: return f"{used} used today"
+        return f"{used} used · {rem}" + (f"/{lim}" if lim else "") + " left today"
+
+    def served(s, p, failed):
+        t = f"{p['name']} · {p['model']} · {s.line(p)}"
+        return t + (f"   (after {', '.join(failed)} failed)" if failed else "")
+
+    def reset(s):
+        with s.lock: s.d = {}; s._save()
 
 
 # ---------- encrypted vault ----------
@@ -446,8 +534,69 @@ def close_app(name, note):
 
 
 # ---------- screen helpers ----------
-def grab_screen():
-    sc = QGuiApplication.screenAt(QCursor.pos()) or QGuiApplication.primaryScreen()
+def resolve_screen(cfg):
+    """Target monitor from settings: 'cursor' (follow mouse), 'primary', or 'name:<QScreen.name()>' (falls back to cursor)."""
+    d = str(cfg.get("display", "cursor"))
+    if d == "primary": return QGuiApplication.primaryScreen()
+    if d.startswith("name:"):
+        for sc in QGuiApplication.screens():
+            if sc.name() == d[5:]: return sc
+    return QGuiApplication.screenAt(QCursor.pos()) or QGuiApplication.primaryScreen()
+
+
+def screen_label(i, sc):
+    g = sc.geometry(); d = sc.devicePixelRatio()
+    return f"Monitor {i + 1} - {int(g.width() * d)}x{int(g.height() * d)}" + (" (primary)" if sc is QGuiApplication.primaryScreen() else "")
+
+
+def place_on(w, sc):
+    """Bind a widget to a screen BEFORE moving it, so Qt applies that screen's DPI scaling (mixed-DPI setups)."""
+    try:
+        w.winId(); h = w.windowHandle()
+        if h is not None and h.screen() is not sc: h.setScreen(sc)
+    except Exception: pass
+
+
+def phys_rect(sc):
+    """(x, y, w, h) of a monitor in PHYSICAL pixels - the coordinate space pyautogui / SetCursorPos use."""
+    if sys.platform == "win32":
+        try:
+            import ctypes
+            from ctypes import wintypes
+            u32 = ctypes.windll.user32; found = []
+
+            class MI(ctypes.Structure):
+                _fields_ = [("cbSize", wintypes.DWORD), ("rcMonitor", wintypes.RECT), ("rcWork", wintypes.RECT),
+                            ("dwFlags", wintypes.DWORD), ("szDevice", wintypes.WCHAR * 32)]
+            Proc = ctypes.WINFUNCTYPE(ctypes.c_int, wintypes.HMONITOR, wintypes.HDC, ctypes.POINTER(wintypes.RECT), wintypes.LPARAM)
+
+            def cb(hm, hdc, rc, lp):
+                mi = MI(); mi.cbSize = ctypes.sizeof(MI)
+                if u32.GetMonitorInfoW(hm, ctypes.byref(mi)): found.append((mi.szDevice, mi.rcMonitor))
+                return 1
+            u32.EnumDisplayMonitors(None, None, Proc(cb), 0)
+            for dev, r in found:
+                if dev == sc.name(): return r.left, r.top, r.right - r.left, r.bottom - r.top
+        except Exception: pass
+    g = sc.geometry(); d = sc.devicePixelRatio()
+    return int(g.x() * d), int(g.y() * d), int(g.width() * d), int(g.height() * d)
+
+
+def force_foreground(w):
+    """Windows refuses focus to background apps; without it the first click on a freshly shown window can be swallowed."""
+    if sys.platform != "win32": return
+    try:
+        import ctypes
+        u = ctypes.windll.user32; hwnd = int(w.winId()); cur = ctypes.windll.kernel32.GetCurrentThreadId()
+        fg = u.GetForegroundWindow(); tid = u.GetWindowThreadProcessId(fg, None) if fg else 0
+        if tid and tid != cur: u.AttachThreadInput(tid, cur, True)
+        u.BringWindowToTop(hwnd); u.SetForegroundWindow(hwnd)
+        if tid and tid != cur: u.AttachThreadInput(tid, cur, False)
+    except Exception: pass
+
+
+def grab_screen(sc=None):
+    sc = sc or QGuiApplication.screenAt(QCursor.pos()) or QGuiApplication.primaryScreen()
     return sc, sc.grabWindow(0)
 
 
@@ -608,7 +757,8 @@ class Selector(QWidget):
 
     def __init__(s, pix, screen):
         super().__init__(None, Qt.WindowType.FramelessWindowHint | Qt.WindowType.WindowStaysOnTopHint | Qt.WindowType.Tool)
-        s.pix = pix; s.a = s.b = None; s.setGeometry(screen.geometry()); s.setCursor(Qt.CursorShape.CrossCursor)
+        s.pix = pix; s.a = s.b = None; place_on(s, screen); s.setGeometry(screen.geometry()); s.setCursor(Qt.CursorShape.CrossCursor)
+        s.setMouseTracking(True)
 
     def sel(s): return QRect(s.a, s.b).normalized() if s.a and s.b else None
 
@@ -629,6 +779,7 @@ class Selector(QWidget):
         if s.a: s.b = e.position().toPoint(); s.update()
 
     def mouseReleaseEvent(s, e):
+        if s.a is None: return                    # release without a press (stray event) must not close the selector
         r = s.sel(); s.finish(s.pix.copy(s.src(r)) if r and r.width() > 10 and r.height() > 10 else None)
 
     def keyPressEvent(s, e):
@@ -842,7 +993,7 @@ CONTROL = {"click", "move", "drag", "scroll", "type", "key", "wait"}
 
 class Overlay(QWidget):
     partial = pyqtSignal(int, str); finished = pyqtSignal(int, bool); heard = pyqtSignal(int, str)
-    acts_done = pyqtSignal(int, object); note = pyqtSignal(str); open_settings = pyqtSignal()
+    acts_done = pyqtSignal(int, object); note = pyqtSignal(str); open_settings = pyqtSignal(); served = pyqtSignal(int, str)
     W, H_COMPACT, H_FULL = 820, 150, 540
 
     def __init__(s, cfg, memory, vault):
@@ -855,6 +1006,7 @@ class Overlay(QWidget):
         s.messages = []; s.pending = None; s.reply = ""; s.kind = "chat"
         s.region = None; s.state = "idle"; s.req = 0; s.sel = None; s._grp = None; s.canvas = None
         s.cool = {}; s.step = 0; s.stop_ev = threading.Event(); s._stealth = False; s._sc = None; s.meta = None
+        s.usage = Usage(USAGE_PATH); s._closing = False; s.scr = None; s.blocked = lambda: False      # blocked(): App says Settings is open -> no automation
 
         outer = QVBoxLayout(s); outer.setContentsMargins(16, 16, 16, 16)
         panel = QFrame(); panel.setObjectName("panel"); outer.addWidget(panel)
@@ -877,6 +1029,7 @@ class Overlay(QWidget):
             b.setCursor(Qt.CursorShape.PointingHandCursor); top.addWidget(b)
         lay.addLayout(top)
         s.out = QTextBrowser(); s.out.setOpenExternalLinks(True); s.out.hide(); lay.addWidget(s.out, 1)
+        s.srcl = QLabel(""); s.srcl.setObjectName("src"); s.srcl.setWordWrap(True); s.srcl.hide(); lay.addWidget(s.srcl)
         bot = QHBoxLayout(); s.edit = QLineEdit(); s.edit.setPlaceholderText("Ask anything, or just speak…")
         s.b_mic = QPushButton("🎤"); s.b_mic.setFixedWidth(40); bot.addWidget(s.edit, 1); bot.addWidget(s.b_mic); lay.addLayout(bot)
         s.setStyleSheet("""
@@ -885,24 +1038,41 @@ class Overlay(QWidget):
             QPushButton{background:#303134;color:#e8eaed;border:none;border-radius:14px;padding:6px 12px;font:12px 'Segoe UI'}
             QPushButton:hover{background:#3c4043} QPushButton:checked{background:#3b5bdb}
             QLineEdit{background:#303134;color:#e8eaed;border:none;border-radius:16px;padding:8px 14px;font:14px 'Segoe UI'}
-            QTextBrowser{background:transparent;color:#e8eaed;border:none;font:14px 'Segoe UI'}""")
+            QTextBrowser{background:transparent;color:#e8eaed;border:none;font:14px 'Segoe UI'}
+            QLabel#src{color:#8ab4f8;font:11px 'Segoe UI'}""")
 
         s.b_x.clicked.connect(s.close_overlay)
-        s.b_set.clicked.connect(lambda: (s.close_overlay(), s.open_settings.emit()))
+        s.b_set.clicked.connect(s.request_settings)
         s.b_sum.clicked.connect(s.summarize); s.b_area.clicked.connect(s.select_area)
         s.b_scr.toggled.connect(s.on_screen_toggle); s.b_can.clicked.connect(s.show_canvas)
         s.b_snd.toggled.connect(s.on_sound_toggle); s.b_mic.clicked.connect(s.mic_clicked)
         s.edit.returnPressed.connect(s.submit_text)
         s.partial.connect(s.on_partial); s.finished.connect(s.on_finished); s.heard.connect(s.on_heard)
-        s.acts_done.connect(s.on_acts_done); s.note.connect(s.on_note)
+        s.acts_done.connect(s.on_acts_done); s.note.connect(s.on_note); s.served.connect(s.on_served)
         s.timer = QTimer(s); s.timer.timeout.connect(s.tick); s.timer.start(33)
 
     # --- geometry / animation ---
+    def screen_now(s):
+        return s.scr or resolve_screen(s.cfg)
+
     def target(s, h):
-        sc = QGuiApplication.screenAt(QCursor.pos()) or QGuiApplication.primaryScreen(); a = sc.availableGeometry()
-        return QRect(a.center().x() - s.W // 2, a.bottom() - h + 1 - 12, s.W, h)
+        a = s.screen_now().availableGeometry(); w = min(s.W, a.width() - 24)
+        return QRect(a.center().x() - w // 2, a.bottom() - h + 1 - 12, w, h)
+
+    def apply_display(s):
+        """Settings changed the target monitor: move an open overlay there now."""
+        s.scr = resolve_screen(s.cfg)
+        if s.isVisible() and not s._closing:
+            place_on(s, s.scr); s.setGeometry(s.target(s.height() or s.H_COMPACT))
+
+    def request_settings(s):
+        s.close_overlay(); QTimer.singleShot(260, s.open_settings.emit)     # open AFTER the click is fully finished and the overlay is gone
 
     def run(s, rect, opacity=None, done=None, ms=280):
+        if s._grp is not None:                          # a stale group used to fire hide() after a quick re-open -> window vanished / clicks lost
+            try: s._grp.finished.disconnect()
+            except Exception: pass
+            s._grp.stop(); s._grp.deleteLater()
         g = QParallelAnimationGroup(s)
         a = QPropertyAnimation(s, b"geometry"); a.setDuration(ms); a.setEndValue(rect)
         a.setEasingCurve(QEasingCurve.Type.OutCubic); g.addAnimation(a)
@@ -911,26 +1081,31 @@ class Overlay(QWidget):
         if done: g.finished.connect(done)
         s._grp = g; g.start()
 
-    def is_open(s): return s.isVisible() and s.windowOpacity() > 0.5
+    def is_open(s): return s.isVisible() and not s._closing and s.windowOpacity() > 0.5
     def toggle(s): s.close_overlay() if s.is_open() else s.open_overlay()
 
     def open_overlay(s, listen=True):
-        s.region = None; s.messages = []; s.pending = None; s.req += 1; s.step = 0; s._stealth = False
+        s.region = None; s.messages = []; s.pending = None; s.req += 1; s.step = 0; s._stealth = False; s._closing = False
+        s.scr = resolve_screen(s.cfg)                  # locked for this session so automation moving the mouse can't switch monitors
         s.speaker.stop()
         s.b_scr.blockSignals(True); s.b_scr.setChecked(False); s.b_scr.blockSignals(False)
-        s.b_area.setText("Select area"); s.out.hide(); s.out.clear(); s.edit.clear()
+        s.b_area.setText("Select area"); s.out.hide(); s.out.clear(); s.srcl.hide(); s.edit.clear()
         warm([p["url"] for p in s.cfg["providers"]] + ([s.cfg["tts_url"]] if s.cfg["tts_provider"] == "openai" else
                                                        ["https://api.elevenlabs.io"] if s.speaker.enabled() else []))
         end = s.target(s.H_COMPACT); start = QRect(end); start.translate(0, 70)
-        s.setGeometry(start); s.setWindowOpacity(0); s.show(); s.raise_(); s.activateWindow(); s.run(end, 1.0)
+        place_on(s, s.scr); s.setGeometry(start); s.setWindowOpacity(0); s.show(); s.raise_(); s.activateWindow(); force_foreground(s)
+        s.run(end, 1.0)
         if listen: s.start_listening()
         else: s.set_state("idle", "Ready")
 
     def close_overlay(s):
         s.req += 1; s.speaker.stop(); s.stop_ev.set()
         if s.rec.stream: s.rec.stop()
-        s._stealth = False; s.state = "idle"; s.orb.mode = "idle"
-        end = QRect(s.geometry()); end.translate(0, 70); s.run(end, 0.0, s.hide, 220)
+        s._stealth = False; s.state = "idle"; s.orb.mode = "idle"; s._closing = True
+        end = QRect(s.geometry()); end.translate(0, 70); s.run(end, 0.0, s._finish_close, 220)
+
+    def _finish_close(s):
+        if s._closing: s.hide()
 
     def keyPressEvent(s, e):
         if e.key() == Qt.Key.Key_Escape: s.close_overlay()
@@ -960,7 +1135,8 @@ class Overlay(QWidget):
     def show_canvas(s):
         if s.canvas is None:
             s.canvas = CanvasWindow(); s.canvas.send.connect(s.region_from_canvas)
-            a = QGuiApplication.primaryScreen().availableGeometry(); s.canvas.move(a.x() + 60, a.y() + 50)
+        if not s.canvas.isVisible():
+            sc = s.screen_now(); a = sc.availableGeometry(); place_on(s.canvas, sc); s.canvas.move(a.x() + 60, a.y() + 50)
         s.canvas.show(); s.canvas.raise_()
 
     def region_from_canvas(s, pix):
@@ -1001,12 +1177,13 @@ class Overlay(QWidget):
 
     def snap_screen(s, cb):
         """Hide the overlay, grab a fresh screenshot, restore the overlay (without taking focus), call cb(pix)."""
-        was = s.isVisible() or s._stealth
+        was = s.isVisible() or s._stealth; tok = s.req
         if was: s.hide()
-        QTimer.singleShot(170 if was else 0, lambda: s._snap_done(cb, was))
+        QTimer.singleShot(170 if was else 0, lambda: s._snap_done(cb, was, tok))
 
-    def _snap_done(s, cb, was):
-        s._sc, pix = grab_screen()
+    def _snap_done(s, cb, was, tok=None):
+        if tok is not None and tok != s.req: return          # overlay was closed / stopped meanwhile: don't re-show it
+        s._sc, pix = grab_screen(s.screen_now())
         if was: s._stealth = False; s.show()
         cb(pix)
 
@@ -1022,8 +1199,8 @@ class Overlay(QWidget):
         QTimer.singleShot(180 if vis else 0, s.pick)
 
     def pick(s):
-        sc, pix = grab_screen(); s.sel = Selector(pix, sc); s.sel.done.connect(s.region_done)
-        s.sel.show(); s.sel.raise_(); s.sel.activateWindow(); s.sel.setFocus()
+        sc, pix = grab_screen(s.screen_now()); s.sel = Selector(pix, sc); s.sel.done.connect(s.region_done)
+        s.sel.show(); s.sel.raise_(); s.sel.activateWindow(); force_foreground(s.sel); s.sel.setFocus()
 
     def region_done(s, pix):
         if not s.isVisible():
@@ -1053,7 +1230,7 @@ class Overlay(QWidget):
             local = any(h in p["url"] for h in ("localhost", "127.0.0.1"))
             if p.get("enabled", True) and p["url"] and p["model"] and (p["key"] or local): out.append(p)
         now = time.time()      # providers that just hit a rate limit / credit error go to the back of the queue
-        return sorted(out, key=lambda p: s.cool.get((p["url"], p["model"]), 0) > now)
+        return sorted(out, key=lambda p: (s.cool.get((p["url"], p["model"]), 0) > now, s.usage.left(p)[1] == 0))   # rate-limited / out-of-quota go last
 
     def system_prompt(s, kind, screen, img):
         sp = SYSTEM_BASE
@@ -1077,8 +1254,8 @@ class Overlay(QWidget):
             s.set_state("idle", "No provider"); s.partial.emit(rid, "⚠️ Add a provider + API key in ⚙ Settings → Providers."); return
         img = prep_image(pix, grid=screen) if pix is not None else None
         if screen and pix is not None and s._sc is not None:        # map screenshot px -> real screen px for clicks
-            dpr = s._sc.devicePixelRatio()
-            s.meta = {"ox": s._sc.geometry().x() * dpr, "oy": s._sc.geometry().y() * dpr, "k": pix.width() / img.width()}
+            px, py, pw, ph = phys_rect(s._sc)             # physical origin of THIS monitor (correct with mixed DPI / negative offsets)
+            s.meta = {"ox": px, "oy": py, "k": pw / img.width()}
         note = text or "(spoken question)"
         if img is not None: note += " [screen attached]"
         s.pending = {"role": "user", "content": note}; s.reply = ""; s.kind = kind
@@ -1115,8 +1292,9 @@ class Overlay(QWidget):
                 if r.status_code != 200:
                     m, delay = short_error(r)
                     if delay: s.cool[(p["url"], p["model"])] = time.time() + delay      # try other providers first for a while
+                    if r.status_code == 429: s.usage.limited(p, r.text)
                     errs.append(f"{name}: {m}"); continue
-                failed = None
+                failed = None; s.usage.rec(p, r.headers)
                 for raw in r.iter_lines():
                     if rid != s.req: r.close(); return
                     if not raw.startswith(b"data:"): continue
@@ -1132,6 +1310,7 @@ class Overlay(QWidget):
                         acc += d; s.partial.emit(rid, acc)
                         if chunker: chunker.feed(strip_actions(acc))
                 if acc:
+                    s.served.emit(rid, s.usage.served(p, list(dict.fromkeys(e.split(':')[0] for e in errs if not e.startswith('Speech')))))
                     if chunker and rid == s.req: chunker.feed(strip_actions(acc), final=True)
                     s.finished.emit(rid, True); return
                 errs.append(f"{name}: {failed or 'empty response'}")
@@ -1139,6 +1318,10 @@ class Overlay(QWidget):
                 if acc: s.partial.emit(rid, acc + f"\n\n⚠️ {ex}"); s.finished.emit(rid, False); return
                 errs.append(f"{name}: {ex}")
         s.partial.emit(rid, "⚠️ " + "\n\n".join(errs)); s.finished.emit(rid, False)
+
+    def on_served(s, rid, txt):
+        if rid != s.req: return
+        s.srcl.setText("● " + txt); s.srcl.show()
 
     def on_heard(s, rid, text):
         if rid != s.req: return
@@ -1171,6 +1354,8 @@ class Overlay(QWidget):
         acts = acts[:12]; results, ctl, look = [], [], False
         for a in acts: a["do"] = str(a.get("do", "")).lower()
         screen_on = s.b_scr.isChecked()
+        if s.blocked():
+            s.after(rid, ["refused: Settings is open - no automation runs while you edit settings"], False); return
         risky = [a for a in acts if a["do"] in CONTROL or a["do"] == "close_app"]
         if s.cfg["confirm_actions"] and risky:
             desc = "\n".join(f"• {a['do']} {json.dumps({k: v for k, v in a.items() if k != 'do'})[:80]}" for a in risky)
@@ -1233,7 +1418,7 @@ class Overlay(QWidget):
 
     def run_control(s, rid, acts, results):
         for a in acts:
-            if s.stop_ev.is_set() or rid != s.req: results.append("stopped"); break
+            if s.stop_ev.is_set() or rid != s.req or s.blocked(): results.append("stopped"); break
             try: results.append(s.control_one(a))
             except pyautogui.FailSafeException: s.stop_ev.set(); results.append("stopped: mouse hit a screen corner (fail-safe)"); break
             except Exception as ex: results.append(f"{a.get('do')}: failed ({ex})")
@@ -1296,8 +1481,8 @@ DARK = """
 
 
 class ProviderDialog(QDialog):
-    def __init__(s, p=None):
-        super().__init__(); s.setWindowTitle("Model provider"); s.setMinimumWidth(560); s.setStyleSheet(DARK); s.result_p = None
+    def __init__(s, p=None, parent=None):
+        super().__init__(parent); s.setWindowTitle("Model provider"); s.setMinimumWidth(560); s.setStyleSheet(DARK); s.result_p = None
         f = QFormLayout(s)
         s.preset = QComboBox(); s.preset.addItems(list(PRESETS))
         s.name = QLineEdit(); s.url = QLineEdit(); s.url.setPlaceholderText("https://…/v1/chat/completions (OpenAI-compatible)")
@@ -1305,20 +1490,22 @@ class ProviderDialog(QDialog):
         s.model = QLineEdit(); s.extra = QLineEdit(); s.extra.setPlaceholderText('extra request fields as JSON, e.g. {"temperature":0.4}')
         s.vision = QCheckBox("Accepts images"); s.audio = QCheckBox("Accepts audio input"); s.enabled = QCheckBox("Enabled")
         f.addRow("Preset", s.preset); f.addRow("Name", s.name); f.addRow("Chat URL", s.url); f.addRow("API key", s.key)
-        f.addRow("Model", s.model); f.addRow("Extra JSON", s.extra); f.addRow("", s.vision); f.addRow("", s.audio); f.addRow("", s.enabled)
+        s.daily = QSpinBox(); s.daily.setRange(0, 1000000); s.daily.setSpecialValueText("unknown")
+        s.daily.setToolTip("Your free daily request quota. Used to show how many requests are left (Groq reports it automatically).")
+        f.addRow("Model", s.model); f.addRow("Daily request limit", s.daily); f.addRow("Extra JSON", s.extra); f.addRow("", s.vision); f.addRow("", s.audio); f.addRow("", s.enabled)
         bar = QHBoxLayout(); c = QPushButton("Cancel"); ok = QPushButton("OK"); ok.setObjectName("save"); bar.addStretch(); bar.addWidget(c); bar.addWidget(ok); f.addRow(bar)
         c.clicked.connect(s.reject); ok.clicked.connect(s.accept)
         if p:
             s.preset.blockSignals(True); s.preset.setCurrentText(p["name"] if p["name"] in PRESETS else "Custom"); s.preset.blockSignals(False)
             s.name.setText(p["name"]); s.url.setText(p["url"]); s.key.setText(p["key"]); s.model.setText(p["model"])
             s.extra.setText(json.dumps(p.get("extra") or {})); s.vision.setChecked(p.get("vision", True))
-            s.audio.setChecked(p.get("audio", False)); s.enabled.setChecked(p.get("enabled", True))
+            s.audio.setChecked(p.get("audio", False)); s.enabled.setChecked(p.get("enabled", True)); s.daily.setValue(int(p.get("daily_limit", 0)))
         else: s.fill(s.preset.currentText())
         s.preset.currentTextChanged.connect(s.fill)
 
     def fill(s, n):
         pr = PRESETS[n]; s.name.setText(n if n != "Custom" else ""); s.url.setText(pr["url"]); s.model.setText(pr["model"])
-        s.extra.setText(json.dumps(pr["extra"])); s.vision.setChecked(pr["vision"]); s.audio.setChecked(pr["audio"]); s.enabled.setChecked(True)
+        s.extra.setText(json.dumps(pr["extra"])); s.vision.setChecked(pr["vision"]); s.audio.setChecked(pr["audio"]); s.enabled.setChecked(True); s.daily.setValue(pr.get("daily_limit", 0))
 
     def accept(s):
         try:
@@ -1329,29 +1516,100 @@ class ProviderDialog(QDialog):
             QMessageBox.warning(s, "Provider", "A chat URL (http…) and a model name are required."); return
         s.result_p = {"name": s.name.text().strip() or "Custom", "url": s.url.text().strip(), "key": s.key.text().strip(),
                       "model": s.model.text().strip(), "extra": extra, "vision": s.vision.isChecked(),
-                      "audio": s.audio.isChecked(), "enabled": s.enabled.isChecked()}
+                      "audio": s.audio.isChecked(), "enabled": s.enabled.isChecked(), "daily_limit": s.daily.value()}
         super().accept()
 
 
-class MemoryDialog(QDialog):
-    def __init__(s, mem):
-        super().__init__(); s.mem = mem; s.setWindowTitle("Long-term memory"); s.setMinimumSize(520, 420); s.setStyleSheet(DARK)
-        lay = QVBoxLayout(s); s.lst = QListWidget(); lay.addWidget(s.lst, 1)
-        row = QHBoxLayout(); s.new = QLineEdit(); s.new.setPlaceholderText("Add something to remember…")
-        add = QPushButton("Add"); dele = QPushButton("Delete selected"); row.addWidget(s.new, 1); row.addWidget(add); lay.addLayout(row); lay.addWidget(dele)
-        lay.addWidget(QLabel("Stored in memory.json (not encrypted). Put secrets in the vault instead."))
-        add.clicked.connect(s.add); s.new.returnPressed.connect(s.add); dele.clicked.connect(s.delete); s.refresh()
+class MemoryPanel(QWidget):
+    """Browse / search / edit / export the assistant's long-term memory (memory.json)."""
 
-    def refresh(s): s.lst.clear(); s.lst.addItems([i["text"] for i in s.mem.items])
+    def __init__(s, mem, parent=None):
+        super().__init__(parent); s.mem = mem; s._sig = None
+        lay = QVBoxLayout(s); lay.setContentsMargins(0, 0, 0, 0); lay.setSpacing(10)
+        top = QHBoxLayout(); s.count = QLabel(); s.count.setObjectName("h2"); top.addWidget(s.count); top.addStretch()
+        s.search = QLineEdit(); s.search.setPlaceholderText("Search memories…"); s.search.setClearButtonEnabled(True); s.search.setMinimumWidth(220)
+        top.addWidget(s.search); lay.addLayout(top)
+        s.bar = QProgressBar(); s.bar.setRange(0, 100); s.bar.setTextVisible(False); s.bar.setFixedHeight(8); lay.addWidget(s.bar)
+        s.budget = QLabel(); s.budget.setObjectName("hint"); s.budget.setWordWrap(True); lay.addWidget(s.budget)
+        s.lst = QListWidget(); s.lst.setMinimumHeight(250); s.lst.setSpacing(2); s.lst.setWordWrap(True)
+        s.lst.setSelectionMode(QListWidget.SelectionMode.ExtendedSelection); lay.addWidget(s.lst, 1)
+        row = QHBoxLayout(); s.new = QLineEdit(); s.new.setPlaceholderText("Add something for the assistant to remember…")
+        s.b_add = QPushButton("Add"); s.b_add.setObjectName("save"); row.addWidget(s.new, 1); row.addWidget(s.b_add); lay.addLayout(row)
+        row = QHBoxLayout(); s.b_edit = QPushButton("Edit"); s.b_del = QPushButton("Delete"); s.b_exp = QPushButton("Export…"); s.b_clr = QPushButton("Clear all")
+        s.b_clr.setObjectName("danger")
+        for b in (s.b_edit, s.b_del, s.b_exp): row.addWidget(b)
+        row.addStretch(); row.addWidget(s.b_clr); lay.addLayout(row)
+        n = QLabel("Stored in memory.json - not encrypted. Passwords and keys are refused here; use the secure vault for secrets.")
+        n.setObjectName("hint"); n.setWordWrap(True); lay.addWidget(n)
+        for b in s.findChildren(QPushButton): b.setAutoDefault(False)
+        s.search.textChanged.connect(lambda _: s.refresh()); s.b_add.clicked.connect(s.add); s.new.returnPressed.connect(s.add)
+        s.b_edit.clicked.connect(s.edit); s.lst.itemDoubleClicked.connect(lambda _: s.edit()); s.b_del.clicked.connect(s.delete)
+        s.b_exp.clicked.connect(s.export); s.b_clr.clicked.connect(s.clear_all); s.lst.itemSelectionChanged.connect(s._buttons)
+        s.poll = QTimer(s); s.poll.timeout.connect(s._poll); s.poll.start(1500)       # the assistant can add/forget items while this is open
+        s.refresh()
+
+    def _signature(s): return (len(s.mem.items), hash(tuple(i["text"] for i in s.mem.items)))
+
+    def _poll(s):
+        if s.isVisible() and s._signature() != s._sig: s.refresh()
+
+    def showEvent(s, e): s.refresh(); super().showEvent(e)
+
+    def _buttons(s):
+        n = len(s.lst.selectedItems()); s.b_edit.setEnabled(n == 1); s.b_del.setEnabled(n >= 1)
+
+    def refresh(s):
+        keep = {it.data(Qt.ItemDataRole.UserRole) for it in s.lst.selectedItems()}
+        total, inc, used, limit = s.mem.stats(); q = s.search.text().strip().lower(); s._sig = s._signature()
+        s.lst.clear(); first_sent = total - inc
+        for idx, it in enumerate(s.mem.items):
+            if q and q not in it["text"].lower(): continue
+            ts = it.get("ts"); date = time.strftime("%b %d, %Y", time.localtime(ts)) if ts else "unknown date"
+            note = "" if idx >= first_sent else "  ·  ⚠ not sent to the model (over budget)"
+            li = QListWidgetItem(f"{it["text"]}\n{date}{note}"); li.setData(Qt.ItemDataRole.UserRole, idx); s.lst.addItem(li)
+            if idx in keep: li.setSelected(True)
+        s.count.setText(f"{total} memor{'y' if total == 1 else 'ies'}" + (f"  ·  {s.lst.count()} shown" if q else ""))
+        s.bar.setValue(min(100, int(used * 100 / limit))); s.budget.setText(
+            f"{used} / {limit} characters of the prompt budget used." + (f" The oldest {total - inc} won't be sent to the model." if inc < total else ""))
+        s._buttons()
+
+    def _selected_idx(s): return sorted(it.data(Qt.ItemDataRole.UserRole) for it in s.lst.selectedItems())
 
     def add(s):
+        if not s.new.text().strip(): return
         ok, msg = s.mem.add(s.new.text())
-        if not ok: QMessageBox.warning(s, "Memory", msg)
-        s.new.clear(); s.refresh()
+        if not ok: QMessageBox.warning(s, "Memory", msg); return
+        s.new.clear(); s.refresh(); s.lst.scrollToBottom()
+
+    def edit(s):
+        idx = s._selected_idx()
+        if len(idx) != 1: return
+        cur = s.mem.items[idx[0]]["text"]
+        text, ok = QInputDialog.getText(s, "Edit memory", "Memory:", QLineEdit.EchoMode.Normal, cur)
+        if not ok: return
+        done, msg = s.mem.edit(idx[0], text)
+        if not done: QMessageBox.warning(s, "Memory", msg)
+        s.refresh()
 
     def delete(s):
-        r = s.lst.currentRow()
-        if r >= 0: s.mem.remove_index(r); s.refresh()
+        for i in reversed(s._selected_idx()): s.mem.remove_index(i)
+        s.refresh()
+
+    def clear_all(s):
+        if s.mem.items and QMessageBox.question(s, "Clear memory", f"Delete all {len(s.mem.items)} memories? This can't be undone.") == QMessageBox.StandardButton.Yes:
+            s.mem.clear(); s.refresh()
+
+    def export(s):
+        path, _ = QFileDialog.getSaveFileName(s, "Export memory", "memory_export.json", "JSON (*.json)")
+        if path:
+            try: s.mem.export(path)
+            except Exception as ex: QMessageBox.warning(s, "Memory", f"Export failed: {ex}")
+
+
+class MemoryDialog(QDialog):
+    def __init__(s, mem, parent=None):
+        super().__init__(parent); s.setWindowTitle("Long-term memory"); s.setMinimumSize(560, 520); s.setStyleSheet(SETTINGS_QSS)
+        lay = QVBoxLayout(s); lay.addWidget(MemoryPanel(mem))
 
 
 class VaultDialog(QDialog):
@@ -1398,123 +1656,302 @@ def open_vault_manager(vault):
     VaultDialog(vault, key, entries).exec()
 
 
+SETTINGS_QSS = DARK + """
+    #nav{background:#1a1b1e;border:none;border-radius:12px;padding:6px;outline:0}
+    #nav::item{color:#c4c7c5;padding:10px 12px;border-radius:8px;margin:2px 0}
+    #nav::item:selected{background:#3b5bdb;color:#fff} #nav::item:hover:!selected{background:#2a2b2e}
+    QFrame#card{background:#26282b;border:1px solid #34373b;border-radius:12px}
+    QLabel#h1{font:600 20px 'Segoe UI';color:#fff} QLabel#h2{font:600 14px 'Segoe UI';color:#fff}
+    QLabel#hint{color:#9aa0a6;font:12px 'Segoe UI'}
+    QProgressBar{background:#303134;border:none;border-radius:4px} QProgressBar::chunk{background:#8ab4f8;border-radius:4px}
+    QPushButton#danger{background:#5c2b2b} QPushButton#danger:hover{background:#7a3535}
+    QListWidget::item{padding:6px;border-radius:6px} QListWidget::item:selected{background:#3b5bdb;color:#fff}
+    QScrollBar:vertical{background:transparent;width:10px} QScrollBar::handle:vertical{background:#3c4043;border-radius:5px;min-height:30px}
+    QScrollBar::add-line,QScrollBar::sub-line{height:0}"""
+
+
+def mk_card(title, hint=None):
+    f = QFrame(); f.setObjectName("card"); v = QVBoxLayout(f); v.setContentsMargins(16, 14, 16, 14); v.setSpacing(10)
+    t = QLabel(title); t.setObjectName("h2"); v.addWidget(t)
+    if hint: h = QLabel(hint); h.setObjectName("hint"); h.setWordWrap(True); v.addWidget(h)
+    form = QFormLayout(); form.setHorizontalSpacing(16); form.setVerticalSpacing(10)
+    form.setFieldGrowthPolicy(QFormLayout.FieldGrowthPolicy.ExpandingFieldsGrow); v.addLayout(form)
+    return f, form, v
+
+
+def mk_page(title, *cards):
+    sa = QScrollArea(); sa.setWidgetResizable(True); sa.setFrameShape(QFrame.Shape.NoFrame)
+    inner = QWidget(); v = QVBoxLayout(inner); v.setContentsMargins(0, 0, 8, 0); v.setSpacing(12)
+    h = QLabel(title); h.setObjectName("h1"); v.addWidget(h)
+    for c in cards: v.addWidget(c)
+    v.addStretch(); sa.setWidget(inner); sa.viewport().setAutoFillBackground(False); inner.setAutoFillBackground(False)
+    return sa
+
+
+def hint_label(text):
+    l = QLabel(text); l.setObjectName("hint"); l.setWordWrap(True); return l
+
+
+class SecretEdit(QWidget):
+    """API-key field: hidden by default, Show/Hide toggle."""
+    def __init__(s, placeholder="Paste API key"):
+        super().__init__(); h = QHBoxLayout(s); h.setContentsMargins(0, 0, 0, 0); h.setSpacing(6)
+        s.e = QLineEdit(); s.e.setEchoMode(QLineEdit.EchoMode.Password); s.e.setPlaceholderText(placeholder)
+        s.b = QPushButton("Show"); s.b.setCheckable(True); s.b.setFixedWidth(64); s.b.setAutoDefault(False)
+        s.b.toggled.connect(lambda on: (s.e.setEchoMode(QLineEdit.EchoMode.Normal if on else QLineEdit.EchoMode.Password), s.b.setText("Hide" if on else "Show")))
+        h.addWidget(s.e, 1); h.addWidget(s.b)
+
+    def text(s): return s.e.text().strip()
+    def setText(s, t): s.e.setText(t or "")
+
+
+class HotkeyEdit(QLineEdit):
+    """Captures a shortcut with Qt key events (no global keyboard hook, so keys are never forwarded to other apps)."""
+    captured = pyqtSignal(str)
+    K = Qt.Key
+    NAMES = {K.Key_Space.value: "space", K.Key_Return.value: "enter", K.Key_Enter.value: "enter", K.Key_Tab.value: "tab",
+             K.Key_Backspace.value: "backspace", K.Key_Delete.value: "delete", K.Key_Insert.value: "insert", K.Key_Home.value: "home",
+             K.Key_End.value: "end", K.Key_PageUp.value: "page up", K.Key_PageDown.value: "page down", K.Key_Up.value: "up",
+             K.Key_Down.value: "down", K.Key_Left.value: "left", K.Key_Right.value: "right"}
+    MODS = {K.Key_Control.value, K.Key_Shift.value, K.Key_Alt.value, K.Key_Meta.value, K.Key_AltGr.value, K.Key_unknown.value}
+
+    def __init__(s): super().__init__(); s.setReadOnly(True); s.rec = False; s._prev = ""
+
+    def start(s): s.rec = True; s._prev = s.text(); s.setText("Press the shortcut…  (Esc cancels)"); s.setFocus()
+
+    def _end(s, text, emit):
+        s.rec = False; s.setText(text); s.captured.emit(emit)
+
+    def event(s, e):
+        if s.rec and e.type() == QEvent.Type.ShortcutOverride: e.accept(); return True
+        if s.rec and e.type() == QEvent.Type.KeyPress: s.keyPressEvent(e); return True
+        return super().event(e)
+
+    def focusOutEvent(s, e):
+        if s.rec: s._end(s._prev, "")
+        super().focusOutEvent(e)
+
+    def keyPressEvent(s, e):
+        if not s.rec: return super().keyPressEvent(e)
+        k = e.key()
+        if k == Qt.Key.Key_Escape.value: s._end(s._prev, ""); return
+        if k in s.MODS: return
+        m, KM = e.modifiers(), Qt.KeyboardModifier; parts = []
+        for flag, name in ((KM.ControlModifier, "ctrl"), (KM.AltModifier, "alt"), (KM.ShiftModifier, "shift"), (KM.MetaModifier, "windows")):
+            if m & flag: parts.append(name)
+        if k in s.NAMES: parts.append(s.NAMES[k])
+        elif Qt.Key.Key_F1.value <= k <= Qt.Key.Key_F24.value: parts.append(f"f{k - Qt.Key.Key_F1.value + 1}")
+        else:
+            nm = QKeySequence(k).toString().lower()
+            if not nm: return
+            parts.append(nm)
+        combo = "+".join(parts); s._end(combo, combo)
+
+
 class Settings(QDialog):
-    captured = pyqtSignal(str, str)
+    PAGES = ["General", "Providers", "API keys", "Voice", "Display", "Memory", "Data"]
 
     def __init__(s, app):
-        super().__init__(); s.app = app; s.recording = None; s.provs = []
-        s.setWindowTitle("AI Overlay - Settings"); s.setMinimumWidth(620); s.setStyleSheet(DARK)
-        root = QVBoxLayout(s); tabs = QTabWidget(); root.addWidget(tabs)
+        super().__init__(); s.app = app; s.recording = None; s.provs = []; s.krows = []; s._ids = []
+        s.setWindowTitle("AI Overlay - Settings"); s.setMinimumSize(780, 540); s.resize(880, 620); s.setStyleSheet(SETTINGS_QSS)
+        root = QVBoxLayout(s); root.setContentsMargins(14, 14, 14, 12); root.setSpacing(10)
+        body = QHBoxLayout(); body.setSpacing(14); root.addLayout(body, 1)
+        s.nav = QListWidget(); s.nav.setObjectName("nav"); s.nav.setFixedWidth(168); s.nav.addItems(s.PAGES); body.addWidget(s.nav)
+        s.stack = QStackedWidget(); body.addWidget(s.stack, 1)
+        for build in (s._general, s._providers, s._apikeys, s._voice, s._display, s._memory, s._data): s.stack.addWidget(build())
+        s.nav.currentRowChanged.connect(s.stack.setCurrentIndex); s.nav.setCurrentRow(0)
 
-        # General
-        g = QWidget(); gf = QFormLayout(g)
+        bar = QHBoxLayout(); s.status = QLabel(""); s.status.setObjectName("hint")
+        cancel = QPushButton("Cancel"); save = QPushButton("Save"); save.setObjectName("save")
+        cancel.clicked.connect(s.close); save.clicked.connect(s.save)
+        bar.addWidget(s.status, 1); bar.addWidget(cancel); bar.addWidget(save); root.addLayout(bar)
+        for b in s.findChildren(QPushButton): b.setAutoDefault(False); b.setDefault(False)    # Enter in a field must never press a random button
+        for k, _ in HK_LABELS: s.edits[k].captured.connect(lambda combo, k=k: s.on_captured(k, combo))
+
+    # ---------- pages ----------
+    def _general(s):
+        c1, f1, _ = mk_card("Assistant behavior")
         s.effort = QComboBox(); s.effort.addItems(["minimal", "low", "medium", "high"])
         s.sil = QDoubleSpinBox(); s.sil.setRange(0.4, 5); s.sil.setSingleStep(0.1); s.sil.setSuffix(" s")
-        s.confirm = QCheckBox("Ask before every mouse / keyboard / close-app action"); s.steps = QSpinBox(); s.steps.setRange(1, 25)
-        s.maxtok = QSpinBox(); s.maxtok.setRange(100, 4000); s.maxtok.setSingleStep(100)
-        gf.addRow("Thinking effort (minimal = fastest)", s.effort); gf.addRow("Auto-send after silence", s.sil)
-        gf.addRow("", s.confirm); gf.addRow("Max steps per request (Screen control)", s.steps)
-        gf.addRow("Max reply tokens (lower = cheaper)", s.maxtok)
+        s.steps = QSpinBox(); s.steps.setRange(1, 25); s.maxtok = QSpinBox(); s.maxtok.setRange(100, 4000); s.maxtok.setSingleStep(100)
+        s.confirm = QCheckBox("Ask before every mouse / keyboard / close-app action")
+        f1.addRow("Thinking effort", s.effort); f1.addRow("Auto-send after silence", s.sil); f1.addRow("Max reply tokens", s.maxtok)
+        f1.addRow("Max steps (Screen control)", s.steps); f1.addRow("", s.confirm)
+        c2, f2, v2 = mk_card("Hotkeys", "Click Change, then press the new shortcut. Use a modifier (Ctrl / Alt / Shift / Win) or an F-key.")
         s.edits, s.btns = {}, {}
         for k, label in HK_LABELS:
-            row = QHBoxLayout(); e = QLineEdit(); e.setReadOnly(True); b = QPushButton("Record")
-            b.clicked.connect(lambda _, k=k: s.record(k)); row.addWidget(e, 1); row.addWidget(b)
-            s.edits[k], s.btns[k] = e, b; gf.addRow(label, row)
-        tabs.addTab(g, "General")
+            row = QHBoxLayout(); e = HotkeyEdit(); b = QPushButton("Change"); b.setFixedWidth(84)
+            b.clicked.connect(lambda _, k=k: s.record(k)); row.addWidget(e, 1); row.addWidget(b); s.edits[k], s.btns[k] = e, b; f2.addRow(label, row)
+        rb = QPushButton("Reset to defaults"); rb.clicked.connect(s.reset_hk); v2.addWidget(rb, 0, Qt.AlignmentFlag.AlignLeft)
+        return mk_page("General", c1, c2)
 
-        # Providers
-        pw = QWidget(); pl = QVBoxLayout(pw)
-        pl.addWidget(QLabel("Tried top to bottom; the first that answers wins. Any OpenAI-compatible endpoint works."))
-        s.plist = QListWidget(); pl.addWidget(s.plist, 1)
+    def _providers(s):
+        c, f, v = mk_card("Model providers", "Tried top to bottom; the first that answers wins. Any OpenAI-compatible endpoint works. API keys are managed in the “API keys” tab.")
+        s.plist = QListWidget(); s.plist.setMinimumHeight(220); v.addWidget(s.plist, 1)
         row = QHBoxLayout()
         for txt, fn in (("Add", s.p_add), ("Edit", s.p_edit), ("Remove", s.p_del), ("↑", lambda: s.p_move(-1)), ("↓", lambda: s.p_move(1))):
             b = QPushButton(txt); b.clicked.connect(fn); row.addWidget(b)
-        pl.addLayout(row); tabs.addTab(pw, "Providers")
+        row.addStretch(); v.addLayout(row); s.plist.itemDoubleClicked.connect(lambda _: s.p_edit())
+        c2, f2, v2 = mk_card("Usage today", "Requests sent per provider (resets daily; Gemini at midnight Pacific). “Left” uses the daily limit set for the provider - "
+                                            "Groq reports the real number itself. Providers that run out are tried last.")
+        s.usage_lbl = QLabel(""); s.usage_lbl.setWordWrap(True); v2.addWidget(s.usage_lbl)
+        rb = QPushButton("Reset counters"); rb.clicked.connect(lambda: (s.app.ov.usage.reset(), s.p_usage())); v2.addWidget(rb, 0, Qt.AlignmentFlag.AlignLeft)
+        s.utimer = QTimer(s); s.utimer.timeout.connect(lambda: s.isVisible() and s.p_usage()); s.utimer.start(2000)
+        return mk_page("Providers", c, c2)
 
-        # Voice
-        v = QWidget(); vf = QFormLayout(v)
-        s.tts = QComboBox(); s.tts.addItems(["off", "elevenlabs", "openai"])
-        s.tkey = QLineEdit(); s.tkey.setEchoMode(QLineEdit.EchoMode.Password); s.tvoice = QLineEdit(); s.tmodel = QLineEdit(); s.turl = QLineEdit()
+    def _apikeys(s):
+        c1, s.kform, _ = mk_card("Model providers", "One key per provider. Leave empty for local servers (Ollama, LM Studio).")
+        c2, f2, _ = mk_card("Voice & speech", "Text-to-speech key (ElevenLabs or an OpenAI-compatible TTS) and the optional Whisper-style speech-to-text key.")
+        s.tkey = SecretEdit("TTS API key (ElevenLabs / OpenAI)"); s.skey = SecretEdit("STT API key (e.g. Groq)")
+        f2.addRow("TTS API key", s.tkey); f2.addRow("STT API key", s.skey)
+        c3, f3, v3 = mk_card("Where keys are stored")
+        v3.addWidget(hint_label("Keys are saved as plain text in config.json next to the program. Don't share or commit that file. "
+                                "If a TTS key is empty, the ELEVENLABS_API_KEY environment variable is used."))
+        return mk_page("API keys", c1, c2, c3)
+
+    def _voice(s):
+        c1, f1, _ = mk_card("Voice output", "Set the TTS API key in the “API keys” tab.")
+        s.tts = QComboBox(); s.tts.addItems(["off", "elevenlabs", "openai"]); s.tvoice = QLineEdit(); s.tmodel = QLineEdit(); s.turl = QLineEdit()
         test = QPushButton("Test voice"); test.clicked.connect(s.test_voice)
-        s.stt = QComboBox(); s.stt.addItems(["native", "transcribe"]); s.surl = QLineEdit(); s.skey = QLineEdit(); s.skey.setEchoMode(QLineEdit.EchoMode.Password); s.smodel = QLineEdit()
-        vf.addRow("Voice output", s.tts); vf.addRow("TTS API key", s.tkey); vf.addRow("Voice ID / name", s.tvoice); vf.addRow("TTS model", s.tmodel)
-        vf.addRow("TTS URL (openai-compatible only)", s.turl); vf.addRow("", test)
-        vf.addRow("Speech input", s.stt); vf.addRow("Whisper-style URL", s.surl); vf.addRow("STT API key", s.skey); vf.addRow("STT model", s.smodel)
-        vf.addRow("", QLabel("native = audio goes straight to the model. transcribe = fast Whisper API first (needed for text-only models)."))
-        tabs.addTab(v, "Voice")
+        f1.addRow("Provider", s.tts); f1.addRow("Voice ID / name", s.tvoice); f1.addRow("TTS model", s.tmodel)
+        f1.addRow("TTS URL (OpenAI-compatible)", s.turl); f1.addRow("", test)
+        c2, f2, _ = mk_card("Speech input", "native = audio goes straight to the model. transcribe = a fast Whisper API first (needed for text-only models).")
+        s.stt = QComboBox(); s.stt.addItems(["native", "transcribe"]); s.surl = QLineEdit(); s.smodel = QLineEdit()
+        f2.addRow("Mode", s.stt); f2.addRow("Whisper-style URL", s.surl); f2.addRow("STT model", s.smodel)
+        return mk_page("Voice", c1, c2)
 
-        # Data
-        d = QWidget(); dl = QVBoxLayout(d)
-        bm = QPushButton("Manage long-term memory…"); bv = QPushButton("Secure vault (passwords)…")
-        bm.clicked.connect(lambda: MemoryDialog(s.app.memory).exec()); bv.clicked.connect(lambda: open_vault_manager(s.app.vault))
-        dl.addWidget(bm); dl.addWidget(bv)
-        dl.addWidget(QLabel("The vault is encrypted with your master password. The assistant can only ask for an entry;\nthe password prompt and the reveal happen locally and are never sent to any AI."))
-        dl.addStretch(); tabs.addTab(d, "Data")
+    def _display(s):
+        c1, f1, v1 = mk_card("Target monitor", "Choose which monitor the overlay (and the Canvas, screenshots and area selection) uses.")
+        s.disp = QComboBox(); row = QHBoxLayout(); ident = QPushButton("Identify monitors"); ident.clicked.connect(s.identify_screens)
+        row.addWidget(s.disp, 1); row.addWidget(ident); f1.addRow("Open overlay on", row)
+        s.disp_info = hint_label(""); v1.addWidget(s.disp_info)
+        c2, f2, v2 = mk_card("How it works")
+        v2.addWidget(hint_label("“Follow the mouse cursor” opens on whichever monitor the pointer is on when you press the hotkey. The monitor is then "
+                                "kept for that session, so Screen control stays on the same display even while it moves the mouse. "
+                                "If a chosen monitor is unplugged, the overlay falls back to the cursor's monitor. The emergency-stop screen corners "
+                                "refer to the primary monitor."))
+        return mk_page("Display", c1, c2)
 
-        bar = QHBoxLayout(); reset = QPushButton("Reset hotkeys"); reset.clicked.connect(s.reset_hk)
-        cancel = QPushButton("Cancel"); cancel.clicked.connect(s.close); save = QPushButton("Save"); save.setObjectName("save"); save.clicked.connect(s.save)
-        bar.addWidget(reset); bar.addStretch(); bar.addWidget(cancel); bar.addWidget(save); root.addLayout(bar)
-        s.captured.connect(s.on_captured)
+    def _memory(s):
+        c, f, v = mk_card("Long-term memory"); s.memory_panel = MemoryPanel(s.app.memory); v.addWidget(s.memory_panel)
+        return mk_page("Memory", c)
 
+    def _data(s):
+        c1, f1, v1 = mk_card("Secure vault", "Encrypted with your master password. The assistant can only ask for an entry; the password prompt and the reveal "
+                                              "happen locally and are never sent to any AI.")
+        bv = QPushButton("Open secure vault…"); bv.clicked.connect(lambda: open_vault_manager(s.app.vault)); v1.addWidget(bv, 0, Qt.AlignmentFlag.AlignLeft)
+        c2, f2, v2 = mk_card("Files", "config.json, memory.json and vault.bin live next to the program.")
+        bf = QPushButton("Open data folder"); bf.clicked.connect(s.open_folder); v2.addWidget(bf, 0, Qt.AlignmentFlag.AlignLeft)
+        return mk_page("Data", c1, c2)
+
+    def open_folder(s):
+        try: os.startfile(BASE)
+        except Exception: subprocess.Popen(["explorer", BASE], creationflags=NO_WINDOW)
+
+    # ---------- load / lifecycle ----------
     def load(s):
         c = s.app.cfg
-        s.effort.setCurrentText(c["effort"]); s.sil.setValue(float(c["silence"])); s.confirm.setChecked(c["confirm_actions"]); s.steps.setValue(int(c["max_steps"])); s.maxtok.setValue(int(c["max_tokens"]))
+        s.effort.setCurrentText(c["effort"]); s.sil.setValue(float(c["silence"])); s.confirm.setChecked(c["confirm_actions"])
+        s.steps.setValue(int(c["max_steps"])); s.maxtok.setValue(int(c["max_tokens"]))
         for k, _ in HK_LABELS: s.edits[k].setText(c[k])
         s.provs = copy.deepcopy(c["providers"]); s.p_refresh()
         s.tts.setCurrentText(c["tts_provider"]); s.tkey.setText(c["tts_key"]); s.tvoice.setText(c["tts_voice"]); s.tmodel.setText(c["tts_model"]); s.turl.setText(c["tts_url"])
         s.stt.setCurrentText(c["stt_mode"]); s.surl.setText(c["stt_url"]); s.skey.setText(c["stt_key"]); s.smodel.setText(c["stt_model"])
+        s.refresh_displays(c.get("display", "cursor")); s.memory_panel.refresh(); s.status.setText("")
 
-    def showEvent(s, e): s.load(); super().showEvent(e)
+    def showEvent(s, e):
+        if not e.spontaneous(): s.load()          # only on a real open - never wipe unsaved edits when restored from minimize
+        super().showEvent(e)
 
-    # providers list
+    def closeEvent(s, e):
+        for ed in s.edits.values():
+            if ed.rec: ed._end(ed._prev, "")
+        if s.recording: s.recording = None; s.app.apply_hotkeys()
+        super().closeEvent(e)
+
+    # ---------- display ----------
+    def refresh_displays(s, sel=None):
+        sel = sel if sel is not None else (s.disp.currentData() or s.app.cfg.get("display", "cursor"))
+        s.disp.blockSignals(True); s.disp.clear()
+        s.disp.addItem("Follow the mouse cursor", "cursor"); s.disp.addItem("Primary monitor", "primary")
+        lines = []
+        for i, sc in enumerate(QGuiApplication.screens()):
+            s.disp.addItem(screen_label(i, sc), "name:" + sc.name()); lines.append(screen_label(i, sc))
+        ix = s.disp.findData(sel); s.disp.setCurrentIndex(ix if ix >= 0 else 0); s.disp.blockSignals(False)
+        s.disp_info.setText("Detected: " + "  |  ".join(lines) if lines else "No monitors detected")
+
+    def identify_screens(s):
+        for w in s._ids: w.close()
+        s._ids = []
+        for i, sc in enumerate(QGuiApplication.screens()):
+            w = QLabel(str(i + 1)); w.setWindowFlags(Qt.WindowType.FramelessWindowHint | Qt.WindowType.WindowStaysOnTopHint | Qt.WindowType.Tool | Qt.WindowType.WindowDoesNotAcceptFocus)
+            w.setAttribute(Qt.WidgetAttribute.WA_ShowWithoutActivating); w.setAlignment(Qt.AlignmentFlag.AlignCenter)
+            w.setStyleSheet("background:#3b5bdb;color:white;font:700 64px 'Segoe UI';border-radius:18px"); w.setFixedSize(120, 120)
+            place_on(w, sc); g = sc.geometry(); w.move(g.x() + 30, g.y() + 30); w.show(); s._ids.append(w)
+        QTimer.singleShot(1800, lambda ws=list(s._ids): [w.close() for w in ws])
+
+    # ---------- API keys ----------
+    def k_rebuild(s):
+        while s.kform.rowCount(): s.kform.removeRow(0)
+        s.krows = []
+        if not s.provs: s.kform.addRow(hint_label("No providers yet - add one in the Providers tab."))
+        for p in s.provs:
+            w = SecretEdit("No key set" if p.get("key", "") == "" else ""); w.setText(p.get("key", ""))
+            s.kform.addRow(f"{p['name']}  ({p['model']})", w); s.krows.append((p, w))
+
+    def k_collect(s):
+        for p, w in s.krows: p["key"] = w.text()
+
+    def p_usage(s):
+        u = s.app.ov.usage
+        s.usage_lbl.setText("\n".join(f"{'●' if p.get('enabled', True) else '○'}  {p['name']} · {p['model']}  -  {u.line(p)}" for p in s.provs) or "No providers yet.")
+
+    # ---------- providers list ----------
     def p_refresh(s, sel=0):
         s.plist.clear(); s.plist.addItems([f"{'✔' if p.get('enabled', True) else '✖'} {p['name']} - {p['model']}" for p in s.provs])
         if s.provs: s.plist.setCurrentRow(min(max(sel, 0), len(s.provs) - 1))
+        s.k_rebuild(); s.p_usage()
 
     def p_add(s):
-        d = ProviderDialog()
+        s.k_collect(); d = ProviderDialog(parent=s)
         if d.exec() and d.result_p: s.provs.append(d.result_p); s.p_refresh(len(s.provs) - 1)
 
     def p_edit(s):
         r = s.plist.currentRow()
         if r < 0: return
-        d = ProviderDialog(s.provs[r])
+        s.k_collect(); d = ProviderDialog(s.provs[r], parent=s)
         if d.exec() and d.result_p: s.provs[r] = d.result_p; s.p_refresh(r)
 
     def p_del(s):
         r = s.plist.currentRow()
-        if r >= 0: del s.provs[r]; s.p_refresh(r)
+        if r >= 0: s.k_collect(); del s.provs[r]; s.p_refresh(r)
 
     def p_move(s, d):
         r = s.plist.currentRow(); n = r + d
-        if 0 <= r < len(s.provs) and 0 <= n < len(s.provs): s.provs[r], s.provs[n] = s.provs[n], s.provs[r]; s.p_refresh(n)
+        if 0 <= r < len(s.provs) and 0 <= n < len(s.provs): s.k_collect(); s.provs[r], s.provs[n] = s.provs[n], s.provs[r]; s.p_refresh(n)
 
     def test_voice(s):
-        c = s.app.cfg; c.update(tts_provider=s.tts.currentText(), tts_key=s.tkey.text().strip(), tts_voice=s.tvoice.text().strip(),
+        c = s.app.cfg; c.update(tts_provider=s.tts.currentText(), tts_key=s.tkey.text(), tts_voice=s.tvoice.text().strip(),
                                 tts_model=s.tmodel.text().strip(), tts_url=s.turl.text().strip())
         s.app.ov.speaker.stop(); s.app.ov.speaker.say("Hello! Voice output is working.")
 
-    # hotkeys
+    # ---------- hotkeys ----------
     def reset_hk(s):
         for k, _ in HK_LABELS: s.edits[k].setText(DEFAULTS[k])
 
     def record(s, k):
         if s.recording: return
-        s.recording = k; s.btns[k].setText("Press keys…"); s.app.pause_hotkeys()
-        def run():
-            try: combo = keyboard.read_hotkey(suppress=False)
-            except Exception: combo = ""
-            s.captured.emit(k, combo)
-        threading.Thread(target=run, daemon=True).start()
+        s.recording = k; s.btns[k].setText("Press keys…"); s.app.pause_hotkeys()     # pause globals so the new combo doesn't fire an action
+        s.edits[k].start()
 
     def on_captured(s, k, combo):
         if combo: s.edits[k].setText(combo)
-        s.btns[k].setText("Record"); s.recording = None; s.app.apply_hotkeys()
+        s.btns[k].setText("Change"); s.recording = None; s.app.apply_hotkeys()
 
     @staticmethod
     def valid(combo):
         parts = combo.split("+"); mods = {"ctrl", "alt", "shift", "windows", "left windows", "right windows", "alt gr"}
-        if any(p in mods for p in parts) and len(parts) > 1: return True
+        if any(p in mods for p in parts[:-1]) and len(parts) > 1 and parts[-1] not in mods: return True
         return len(parts) == 1 and parts[0].startswith("f") and parts[0][1:].isdigit()
 
     def save(s):
@@ -1524,12 +1961,15 @@ class Settings(QDialog):
                 QMessageBox.warning(s, "Hotkey", f"“{c}” would fire while you type normally.\nUse a modifier (Ctrl/Alt/Shift/Win) + key, or an F-key."); return
         if len(set(c for c in combos.values() if c)) < len([c for c in combos.values() if c]):
             QMessageBox.warning(s, "Hotkey", "Two actions share the same hotkey."); return
+        s.k_collect()
         s.app.cfg.update(providers=s.provs, effort=s.effort.currentText(), silence=round(s.sil.value(), 2),
                          confirm_actions=s.confirm.isChecked(), max_steps=s.steps.value(), max_tokens=s.maxtok.value(), tts_provider=s.tts.currentText(),
-                         tts_key=s.tkey.text().strip(), tts_voice=s.tvoice.text().strip(), tts_model=s.tmodel.text().strip(),
+                         tts_key=s.tkey.text(), tts_voice=s.tvoice.text().strip(), tts_model=s.tmodel.text().strip(),
                          tts_url=s.turl.text().strip(), stt_mode=s.stt.currentText(), stt_url=s.surl.text().strip(),
-                         stt_key=s.skey.text().strip(), stt_model=s.smodel.text().strip(), **combos)
-        save_cfg(s.app.cfg); s.app.apply_hotkeys(); s.close()
+                         stt_key=s.skey.text(), stt_model=s.smodel.text().strip(), display=s.disp.currentData() or "cursor", **combos)
+        try: save_cfg(s.app.cfg)
+        except Exception as ex: QMessageBox.warning(s, "Settings", f"Couldn't write config.json: {ex}"); return
+        s.app.apply_hotkeys(); s.app.ov.apply_display(); s.close()
 
 
 # ---------- app controller ----------
@@ -1540,19 +1980,30 @@ class App(QObject):
         super().__init__()
         s.cfg = load_cfg(); s.memory = Memory(MEM_PATH); s.vault = Vault(VAULT_PATH)
         s.ov = Overlay(s.cfg, s.memory, s.vault); s.settings = Settings(s)
+        s.ov.blocked = lambda: s.settings.isVisible() or bool(s.settings.recording)
+        QGuiApplication.instance().screenAdded.connect(lambda _: s.on_screens_changed())
+        QGuiApplication.instance().screenRemoved.connect(lambda _: s.on_screens_changed())
         s.toggle.connect(s.ov.toggle); s.summ.connect(s.ov.hotkey_summarize); s.area.connect(s.ov.hotkey_area)
         s.stop.connect(s.ov.emergency_stop); s.ov.open_settings.connect(s.show_settings)
         pm = QPixmap(32, 32); pm.fill(Qt.GlobalColor.transparent)
         p = QPainter(pm); p.setRenderHint(QPainter.RenderHint.Antialiasing)
         p.setBrush(QColor("#8ab4f8")); p.setPen(Qt.PenStyle.NoPen); p.drawEllipse(4, 4, 24, 24); p.end()
         s.tray = QSystemTrayIcon(QIcon(pm)); m = QMenu()
-        for label, fn in (("Open overlay", s.ov.open_overlay), ("Canvas", s.ov.show_canvas), ("Settings", s.show_settings), ("Quit", qapp.quit)):
+        for label, fn in (("Open overlay", lambda: s.ov.open_overlay()), ("Canvas", s.ov.show_canvas), ("Settings", s.show_settings), ("Quit", qapp.quit)):
             a = QAction(label, m); a.triggered.connect(lambda _, fn=fn: fn()); m.addAction(a)
         s.tray.setContextMenu(m); s.tray.setToolTip("AI Overlay"); s.tray.show(); s._menu = m
         s.apply_hotkeys()
         if not s.ov.providers(): s.show_settings()
 
-    def show_settings(s): s.settings.show(); s.settings.raise_(); s.settings.activateWindow()
+    def on_screens_changed(s):
+        s.settings.refresh_displays(); s.ov.apply_display()
+
+    def show_settings(s):
+        w = s.settings
+        if w.isMinimized(): w.showNormal()
+        sc = resolve_screen(s.cfg)
+        if not w.isVisible(): place_on(w, sc); w.move(sc.availableGeometry().center() - w.rect().center())
+        w.show(); w.raise_(); w.activateWindow(); force_foreground(w)
 
     def _clear_hotkeys(s):
         for h in getattr(s, "_hk", []):
