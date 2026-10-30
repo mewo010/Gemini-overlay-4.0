@@ -43,7 +43,7 @@ jobs:
         if: steps.rel.outputs.send == 'true' && (steps.done.outputs.cache-hit != 'true' || github.event_name == 'workflow_dispatch')
         env:
           WEBHOOK: ${{ secrets.DISCORD_WEBHOOK }}
-          SITE: https://YOUR-NAME.pages.dev        # <- change to your site
+          SITE: https://getaioverlay.pages.dev/        # <- change to your site
         run: |
           [ -z "$WEBHOOK" ] && { echo "::error::Secret DISCORD_WEBHOOK is empty or missing"; exit 1; }
           jq -n --slurpfile r rel.json --arg site "$SITE" '
