@@ -5,6 +5,7 @@ name: Discord release announcement
 on:
   release:
     types: [published]        # fires when you publish a release (drafts don't trigger it)
+  workflow_dispatch:          # lets you test it: Actions tab > this workflow > Run workflow
 
 jobs:
   notify:
@@ -13,12 +14,13 @@ jobs:
       - name: Send embed to Discord
         env:
           WEBHOOK: ${{ secrets.DISCORD_WEBHOOK }}
-          TAG: ${{ github.event.release.tag_name }}
+          TAG: ${{ github.event.release.tag_name || 'v-test' }}
           BODY: ${{ github.event.release.body }}
-          RELEASE_URL: ${{ github.event.release.html_url }}
+          RELEASE_URL: ${{ github.event.release.html_url || format('{0}/{1}/releases', github.server_url, github.repository) }}
           SITE: https://getaioverlay.pages.dev/        # <- change to your site
           PRE: ${{ github.event.release.prerelease }}
         run: |
+          [ -z "$WEBHOOK" ] && { echo "::error::Secret DISCORD_WEBHOOK is empty or missing"; exit 1; }
           [ "$PRE" = "true" ] && TITLE="🧪 Pre-release: $TAG" || TITLE="🚀 New update: $TAG"
           jq -n \
             --arg title "$TITLE" \
