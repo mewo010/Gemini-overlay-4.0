@@ -17,7 +17,7 @@ pip install PyQt6 requests keyboard sounddevice numpy pyautogui cryptography
 Run: python ai_overlay.py   (rename to .pyw to hide the console)
 Emergency stop for any automation: Ctrl+Alt+X (rebindable) or fling the mouse into a screen corner.
 """
-import sys, os, io, re, ast, copy, json, wave, time, math, queue, base64, threading, subprocess, webbrowser
+import sys, os, io, re, ast, csv, copy, json, wave, time, math, queue, base64, threading, subprocess, webbrowser
 import urllib.parse
 import requests, keyboard, numpy as np, sounddevice as sd
 if sys.platform == "win32":     # must run before pyautogui/Qt: per-monitor DPI keeps coordinates right on mixed-DPI multi-monitor setups
@@ -157,9 +157,16 @@ ACTIONS_DOC = """ACTIONS - to do something on the user's computer, write your sh
 - draw {shapes:[...], clear?, view?:[xmin,xmax,ymin,ymax]}: math coordinates, y up, default view x -10..10, y about -7..7.
   shapes: {"type":"triangle","points":[[0,0],[4,0],[2,3]],"labels":["A","B","C"],"color":"#8ab4f8","fill":"#8ab4f8"}, polygon {points} or {n,cx,cy,r},
   circle {cx,cy,r}, ellipse {cx,cy,rx,ry}, rect {x,y,w,h}, line {x1,y1,x2,y2}, point {x,y,label}, text {x,y,text}.
+- spotify {cmd:"pause"|"play"|"next"|"previous"|"restart"|"volume_up"|"volume_down"|"mute"} or {query:"song / artist / playlist"}: car-style music control. Transport commands are instant media keys (play/pause is a toggle). With a query, Spotify opens its search; with Screen control ON, then click the green Play button on the top result (or double-click the first song row). Say what you are playing.
+- move_window {monitor:"primary"|"secondary"|"secondary 2", title?:"part of the window title"}: move a window (default: the frontmost one) to another monitor. The result says "verified" or "NOT moved": report exactly that.
 Only when Screen control is ON:
 - click {x,y,button?:"left"|"right",double?:true}, move {x,y}, drag {x1,y1,x2,y2}, scroll {x,y,amount} (positive = up), type {text}, key {keys:"ctrl+l"}, wait {seconds}, observe {}.
-After control actions you automatically get a fresh screenshot. Work in small steps; when the task is finished, answer briefly with NO action block."""
+After control actions you automatically get a fresh screenshot. Work in small steps; when the task is finished, answer briefly with NO action block.
+RULES
+1. Monitors: the "Monitors" list tells you which display is Primary and which are Secondary. Coordinates always refer to the monitor in the screenshot. Never say a window/app was moved or opened unless the action result confirms it ("verified"); if it says NOT moved or failed, say so.
+2. Light mode: group steps. Never emit a "move" right before a click/drag/scroll (those already move the cursor). Put every action you already know about in ONE block; avoid single-pixel nudges and needless wait/observe steps.
+3. After open_app / spotify the app is already waited for before you get results. Do not repeat the launch. If the result says it is still loading, use ONE wait {seconds:3}, then re-check; never spam commands or loop.
+4. Music requests: act immediately (spotify action), no clarifying questions unless the request is truly ambiguous."""
 
 SUMMARY_PROMPT = ("Summarize what's on this screen: one line saying what it is, then 3-5 key points. "
                   "Read-only summary: do not suggest or perform actions.")
@@ -557,7 +564,7 @@ def place_on(w, sc):
     except Exception: pass
 
 
-def phys_rect(sc):
+def phys_rect(sc, work=False):
     """(x, y, w, h) of a monitor in PHYSICAL pixels - the coordinate space pyautogui / SetCursorPos use."""
     if sys.platform == "win32":
         try:
@@ -572,14 +579,201 @@ def phys_rect(sc):
 
             def cb(hm, hdc, rc, lp):
                 mi = MI(); mi.cbSize = ctypes.sizeof(MI)
-                if u32.GetMonitorInfoW(hm, ctypes.byref(mi)): found.append((mi.szDevice, mi.rcMonitor))
+                if u32.GetMonitorInfoW(hm, ctypes.byref(mi)): found.append((mi.szDevice, mi.rcWork if work else mi.rcMonitor))
                 return 1
             u32.EnumDisplayMonitors(None, None, Proc(cb), 0)
             for dev, r in found:
                 if dev == sc.name(): return r.left, r.top, r.right - r.left, r.bottom - r.top
         except Exception: pass
-    g = sc.geometry(); d = sc.devicePixelRatio()
+    g = sc.availableGeometry() if work else sc.geometry(); d = sc.devicePixelRatio()
     return int(g.x() * d), int(g.y() * d), int(g.width() * d), int(g.height() * d)
+
+
+# ---------- multi-monitor awareness / window moving ----------
+def ordered_screens():
+    """Primary first, then the others left-to-right (physical pixels)."""
+    pri = QGuiApplication.primaryScreen()
+    others = sorted((s for s in QGuiApplication.screens() if s is not pri), key=lambda s: phys_rect(s)[:2])
+    return [pri] + others
+
+
+def role_of(sc):
+    scs = ordered_screens()
+    if sc is None or sc not in scs: return "unknown monitor"
+    i = scs.index(sc)
+    return "Primary" if i == 0 else (f"Secondary {i}" if len(scs) > 2 else "Secondary")
+
+
+def monitor_text(current=None):
+    lines = []
+    for sc in ordered_screens():
+        x, y, w, h = phys_rect(sc)
+        lines.append(f"- {role_of(sc)}: {w}x{h} px at ({x},{y})" + ("  <- the attached screenshot shows THIS monitor" if sc is current else ""))
+    return "\n".join(lines)
+
+
+def screen_at_phys(x, y):
+    for sc in ordered_screens():
+        l, t, w, h = phys_rect(sc)
+        if l <= x < l + w and t <= y < t + h: return sc
+    return None
+
+
+def pick_screen(target):
+    scs = ordered_screens(); t = str(target or "").lower().strip()
+    if t in ("primary", "main", "first", "1"): return scs[0]
+    m = re.search(r"(\d+)", t)
+    if t.startswith("secondary") or t in ("other", "second", "next", "external"):
+        i = int(m.group(1)) if m else 1
+        return scs[i] if 0 < i < len(scs) else None
+    if m and 0 < int(m.group(1)) <= len(scs): return scs[int(m.group(1)) - 1]
+    byx = sorted(scs, key=lambda s: phys_rect(s)[0])
+    if t == "left": return byx[0]
+    if t == "right": return byx[-1]
+    return None
+
+
+def _top_windows():
+    """Visible titled top-level windows in z-order (frontmost first), excluding this process."""
+    import ctypes
+    from ctypes import wintypes
+    u = ctypes.windll.user32; out = []; me = os.getpid()
+    Proc = ctypes.WINFUNCTYPE(ctypes.c_bool, wintypes.HWND, wintypes.LPARAM)
+
+    def cb(h, lp):
+        try:
+            if not u.IsWindowVisible(h) or (u.GetWindowLongW(h, -20) & 0x80): return True      # hidden / tool window
+            n = u.GetWindowTextLengthW(h)
+            if n <= 0: return True
+            buf = ctypes.create_unicode_buffer(n + 1); u.GetWindowTextW(h, buf, n + 1)
+            pid = wintypes.DWORD(); u.GetWindowThreadProcessId(h, ctypes.byref(pid))
+            if pid.value != me and buf.value not in ("Program Manager", "Settings"): out.append((h, buf.value))
+        except Exception: pass
+        return True
+    u.EnumWindows(Proc(cb), 0)
+    return out
+
+
+def move_window(target="secondary", title=""):
+    """Move a window to another monitor and VERIFY where it really ended up."""
+    if sys.platform != "win32": return "move_window: Windows only"
+    import ctypes
+    from ctypes import wintypes
+    u = ctypes.windll.user32
+    if len(ordered_screens()) < 2: return "NOT moved: only one monitor is connected"
+    dest = pick_screen(target)
+    if dest is None: return f"NOT moved: unknown monitor '{target}'. Monitors:\n" + monitor_text()
+    t = str(title or "").lower().strip()
+    hit = next(((h, ti) for h, ti in _top_windows() if not t or t in ti.lower()), None)
+    if not hit: return f"NOT moved: no visible window matches '{title}'" if t else "NOT moved: no window found"
+    h, ti = hit; r = wintypes.RECT()
+    zoomed = bool(u.IsZoomed(h))
+    if zoomed or u.IsIconic(h): u.ShowWindow(h, 9)                          # restore, so it can be placed
+    u.GetWindowRect(h, ctypes.byref(r)); w, hh = r.right - r.left, r.bottom - r.top
+    dx, dy, dw, dh = phys_rect(dest, work=True); w, hh = min(w, dw), min(hh, dh)
+    u.SetWindowPos(h, 0, dx + (dw - w) // 2, dy + (dh - hh) // 2, w, hh, 0x0014)   # NOZORDER | NOACTIVATE
+    if zoomed: u.ShowWindow(h, 3)                                           # re-maximize on the new monitor
+    time.sleep(0.25)
+    u.GetWindowRect(h, ctypes.byref(r)); on = screen_at_phys((r.left + r.right) // 2, (r.top + r.bottom) // 2)
+    if on is dest: return f"moved “{ti[:40]}” to {role_of(dest)} (verified)"
+    return f"NOT moved: “{ti[:40]}” is still on {role_of(on)} (it may be running as admin or refuses to move)"
+
+
+# ---------- launch readiness ("Light" + stable) ----------
+_RECENT_OPEN = {}
+
+
+def launch_proc(name):
+    n = _norm(name); k = n if n in APPS else _lookup(APPS, n)
+    if k in APPS and APPS[k][1]: return (APPS[k][1], k)
+    if re.match(r"https?://", n) or n in WEB or _lookup(WEB, n): return ("", "browser")
+    return ("", "start")
+
+
+def _window_ready(proc):
+    """True when the process has a titled window and Windows does not flag it 'Not Responding'."""
+    try:
+        out = subprocess.run(["tasklist", "/V", "/FI", f"IMAGENAME eq {proc}", "/FO", "CSV", "/NH"],
+                             capture_output=True, text=True, creationflags=NO_WINDOW).stdout
+        for r in csv.reader(io.StringIO(out)):
+            if len(r) >= 9 and r[0].lower() == proc.lower() and r[5].lower() != "not responding" and r[8] not in ("N/A", ""): return True
+    except Exception: pass
+    return False
+
+
+def wait_all(procs, stop_ev, timeout=12.0):
+    """Blocking (run in a thread): wait until each launched app is loaded and responsive. Returns result notes."""
+    notes = []
+    for proc, kind in procs:
+        end = time.time() + timeout; ok = True
+        if proc:
+            ok = False
+            while time.time() < end and not stop_ev.is_set():
+                if _window_ready(proc): ok = True; break
+                time.sleep(0.5)
+            if ok: time.sleep(0.8)                                         # let the UI settle after the window appears
+        else: time.sleep(1.8 if kind == "browser" else 2.5)
+        notes.append(f"{kind} is loaded and ready" if ok else f"{kind} is still loading after {int(timeout)}s - wait, do not repeat the command")
+        if stop_ev.is_set(): break
+    return notes
+
+
+# ---------- Spotify / media keys (car-infotainment style) ----------
+MEDIA_KEYS = {"play": "play/pause media", "pause": "play/pause media", "toggle": "play/pause media", "resume": "play/pause media",
+              "next": "next track", "skip": "next track", "previous": "previous track", "prev": "previous track", "back": "previous track",
+              "restart": "previous track", "volume_up": "volume up", "volume_down": "volume down", "mute": "volume mute", "unmute": "volume mute"}
+_FAST = [
+    (r"(?:pause|stop)(?: the)?(?: (?:music|song|track|spotify|playback))|pause", "pause"),
+    (r"(?:resume|unpause|continue)(?: the)?(?: (?:music|song|track|spotify|playback))?|play(?: the)? (?:music|spotify)", "play"),
+    (r"(?:skip|next)(?: (?:the|this))?(?: (?:song|track))?", "next"),
+    (r"go back|previous|prev|last (?:song|track)|back a (?:song|track)|previous (?:song|track)", "previous"),
+    (r"restart(?: (?:the|this))?(?: (?:song|track))?", "restart"),
+    (r"volume up|louder|turn (?:it|the volume) up", "volume_up"),
+    (r"volume down|quieter|softer|turn (?:it|the volume) down", "volume_down"),
+    (r"mute|unmute", "mute"),
+]
+
+
+def fast_media(text):
+    """Pure transport commands skip the model entirely so they run instantly."""
+    t = re.sub(r"[.!?,]+$", "", re.sub(r"^(?:hey |ok |okay )?(?:please |can you |could you )?", "", str(text).lower().strip())).strip()
+    t = re.sub(r" (?:please|now)$", "", t)
+    for pat, cmd in _FAST:
+        if re.fullmatch(pat, t): return {"do": "spotify", "cmd": cmd}
+    return None
+
+
+def spotify_do(a, screen_on=False):
+    """Returns (result message, launched (proc, kind) or None)."""
+    cmd = str(a.get("cmd", "")).lower().strip(); q = str(a.get("query", "")).strip()
+    if q:
+        try: os.startfile("spotify:search:" + urllib.parse.quote(q)); launched = ("Spotify.exe", "spotify")
+        except Exception: webbrowser.open("https://open.spotify.com/search/" + urllib.parse.quote(q)); launched = ("", "browser")
+        hint = ("click the green Play button on the top result" if screen_on else
+                "Screen control is OFF, so I can't press play; tell the user to switch it on or press play on the top result")
+        return f"opened Spotify search for “{q}”; {hint}", launched
+    if cmd in MEDIA_KEYS:
+        try: keyboard.send(MEDIA_KEYS[cmd])
+        except Exception as ex: return f"spotify {cmd}: failed ({ex})", None
+        return f"spotify {cmd}: sent", None
+    return f"spotify: unknown command '{cmd}'", None
+
+
+def coalesce(acts):
+    """Light mode: collapse micro-movements so they don't become separate heavy steps."""
+    out = []
+    for a in acts:
+        d = a["do"]
+        if d == "move" and out and out[-1]["do"] == "move": out[-1] = a; continue        # keep only the last of consecutive moves
+        if d in ("click", "drag", "scroll") and out and out[-1]["do"] == "move": out.pop()   # these move the cursor themselves
+        out.append(a)
+    return out
+
+
+def glide(x, y):
+    """Smooth, distance-scaled cursor move: short hops are near-instant."""
+    cx, cy = pyautogui.position(); d = math.hypot(x - cx, y - cy)
+    pyautogui.moveTo(x, y, duration=0 if d < 4 else min(0.3, 0.04 + d / 5000), tween=pyautogui.easeOutQuad)
 
 
 def force_foreground(w):
@@ -993,7 +1187,7 @@ CONTROL = {"click", "move", "drag", "scroll", "type", "key", "wait"}
 
 class Overlay(QWidget):
     partial = pyqtSignal(int, str); finished = pyqtSignal(int, bool); heard = pyqtSignal(int, str)
-    acts_done = pyqtSignal(int, object); note = pyqtSignal(str); open_settings = pyqtSignal(); served = pyqtSignal(int, str)
+    acts_done = pyqtSignal(int, object); note = pyqtSignal(str); open_settings = pyqtSignal(); served = pyqtSignal(int, str); launched = pyqtSignal(int, object, bool); fast = pyqtSignal(int, object, str)
     W, H_COMPACT, H_FULL = 820, 150, 540
 
     def __init__(s, cfg, memory, vault):
@@ -1048,7 +1242,7 @@ class Overlay(QWidget):
         s.b_snd.toggled.connect(s.on_sound_toggle); s.b_mic.clicked.connect(s.mic_clicked)
         s.edit.returnPressed.connect(s.submit_text)
         s.partial.connect(s.on_partial); s.finished.connect(s.on_finished); s.heard.connect(s.on_heard)
-        s.acts_done.connect(s.on_acts_done); s.note.connect(s.on_note); s.served.connect(s.on_served)
+        s.acts_done.connect(s.on_acts_done); s.note.connect(s.on_note); s.served.connect(s.on_served); s.launched.connect(s.on_launched); s.fast.connect(s.on_fast)
         s.timer = QTimer(s); s.timer.timeout.connect(s.tick); s.timer.start(33)
 
     # --- geometry / animation ---
@@ -1218,6 +1412,9 @@ class Overlay(QWidget):
         if t: s.edit.clear(); s.user_ask(text=t)
 
     def user_ask(s, text=None, audio=None):
+        if text and not audio:
+            fa = fast_media(text)
+            if fa: s.req += 1; s.fast_action(fa, text); return                    # instant, no model round-trip
         if s.b_scr.isChecked():                                    # live mode: always a fresh screenshot
             s.set_state("thinking", "Looking at your screen…")
             s.snap_screen(lambda pix: s.ask(text=text, audio=audio, pix=pix, screen=True))
@@ -1237,6 +1434,7 @@ class Overlay(QWidget):
         if kind == "summarize": sp += " This is a read-only summary request: do not emit action blocks."
         else:
             sp += "\n\n" + ACTIONS_DOC
+            sp += "\n\nMonitors (physical px):\n" + monitor_text(s._sc if screen else None)
             if screen:
                 sp += (f"\n\nScreen control: ON. The attached screenshot is {img.width()}x{img.height()} px with a labelled red coordinate grid; "
                        "all x,y values use that pixel space. Aim for the centre of the target.")
@@ -1255,7 +1453,7 @@ class Overlay(QWidget):
         img = prep_image(pix, grid=screen) if pix is not None else None
         if screen and pix is not None and s._sc is not None:        # map screenshot px -> real screen px for clicks
             px, py, pw, ph = phys_rect(s._sc)             # physical origin of THIS monitor (correct with mixed DPI / negative offsets)
-            s.meta = {"ox": px, "oy": py, "k": pw / img.width()}
+            s.meta = {"ox": px, "oy": py, "k": pw / img.width(), "w": pw, "h": ph}
         note = text or "(spoken question)"
         if img is not None: note += " [screen attached]"
         s.pending = {"role": "user", "content": note}; s.reply = ""; s.kind = kind
@@ -1270,6 +1468,8 @@ class Overlay(QWidget):
                 text = transcribe(s.cfg, audio)
                 if not text: s.partial.emit(rid, "⚠️ Didn't catch that."); s.finished.emit(rid, False); return
                 audio = None; s.heard.emit(rid, text)
+                fa = fast_media(text)
+                if fa: s.fast.emit(rid, fa, text); return
             except Exception as ex: errs.append(f"Speech-to-text: {ex} (sending raw audio instead)")
         b64 = img_to_b64(req["img"]) if req["img"] is not None else None
         a64 = base64.b64encode(audio).decode() if audio else None
@@ -1351,12 +1551,13 @@ class Overlay(QWidget):
 
     # --- actions ---
     def handle_actions(s, rid, acts):
-        acts = acts[:12]; results, ctl, look = [], [], False
+        acts = acts[:12]; results, ctl, look, procs = [], [], False, []
         for a in acts: a["do"] = str(a.get("do", "")).lower()
+        acts = coalesce(acts)
         screen_on = s.b_scr.isChecked()
         if s.blocked():
             s.after(rid, ["refused: Settings is open - no automation runs while you edit settings"], False); return
-        risky = [a for a in acts if a["do"] in CONTROL or a["do"] == "close_app"]
+        risky = [a for a in acts if a["do"] in CONTROL or a["do"] in ("close_app", "move_window")]
         if s.cfg["confirm_actions"] and risky:
             desc = "\n".join(f"• {a['do']} {json.dumps({k: v for k, v in a.items() if k != 'do'})[:80]}" for a in risky)
             if QMessageBox.question(None, "Allow actions?", "The assistant wants to:\n" + desc) != QMessageBox.StandardButton.Yes:
@@ -1369,12 +1570,25 @@ class Overlay(QWidget):
             elif k == "observe":
                 if screen_on: look = True
                 else: results.append("observe: refused, Screen control is OFF")
+            elif k == "open_app":
+                key = _norm(str(a.get("name", "")))
+                if time.time() - _RECENT_OPEN.get(key, 0) < 8: results.append(f"open_app {key}: already launching, waiting for it - do not repeat"); continue
+                _RECENT_OPEN[key] = time.time(); results.append(s.do_local(a)); procs.append(launch_proc(key))
+            elif k == "spotify":
+                msg, pr = spotify_do(a, screen_on); results.append(msg)
+                if pr: procs.append(pr)
+                if a.get("query") and screen_on: look = True
+            elif k == "move_window": results.append(move_window(a.get("monitor", "secondary"), str(a.get("title", ""))))
             else: results.append(s.do_local(a))
+        if procs and screen_on: look = True                                         # fresh screenshot once the app is ready
         if ctl:
             if pyautogui is None: results.append("control unavailable: pip install pyautogui"); s.after(rid, results, look); return
             s.set_state("thinking", "Working… (emergency stop: " + s.cfg["hk_stop"] + ")")
             s._stealth = True; s.hide()                            # get out of the way of clicks
-            threading.Thread(target=s.run_control, args=(rid, ctl, results), daemon=True).start()
+            threading.Thread(target=s.run_control, args=(rid, ctl, results, procs), daemon=True).start()
+        elif procs:
+            s.set_state("thinking", "Waiting for the app to load…")
+            threading.Thread(target=s.wait_then, args=(rid, procs, results, look), daemon=True).start()
         else: s.after(rid, results, look)
 
     def do_local(s, a):
@@ -1393,36 +1607,58 @@ class Overlay(QWidget):
             return f"{k}: failed ({ex})"
         return f"{k}: unknown action"
 
+    def wait_then(s, rid, procs, results, look):
+        results.extend(wait_all(procs, s.stop_ev)); s.launched.emit(rid, results, look)
+
+    def on_launched(s, rid, results, look):
+        if rid == s.req: s.after(rid, results, look)
+        else: s._unstealth()
+
+    def on_fast(s, rid, a, text):
+        if rid == s.req: s.fast_action(a, text)
+
+    def fast_action(s, a, text):
+        s.speaker.stop(); msg, _ = spotify_do(a)
+        s.messages = (s.messages + [{"role": "user", "content": text}, {"role": "assistant", "content": "(done) " + msg}])[-24:]
+        s.set_state("idle", "🎵 " + a["cmd"].replace("_", " "))
+
     def to_screen(s, x, y):
-        m = s.meta or {"ox": 0, "oy": 0, "k": 1.0}
-        return int(m["ox"] + float(x) * m["k"]), int(m["oy"] + float(y) * m["k"])
+        m = s.meta or {"ox": 0, "oy": 0, "k": 1.0, "w": 0, "h": 0}
+        px, py = m["ox"] + float(x) * m["k"], m["oy"] + float(y) * m["k"]
+        if m.get("w"):          # never click outside the monitor the screenshot came from
+            tol = 0.03 * max(m["w"], m["h"])
+            if not (m["ox"] - tol <= px <= m["ox"] + m["w"] + tol and m["oy"] - tol <= py <= m["oy"] + m["h"] + tol):
+                raise ValueError("coordinates fall outside the monitor shown in the screenshot")
+            px = min(max(px, m["ox"]), m["ox"] + m["w"] - 1); py = min(max(py, m["oy"]), m["oy"] + m["h"] - 1)
+        return int(px), int(py)
 
     def control_one(s, a):
         k = a["do"]
         if k == "click":
-            x, y = s.to_screen(a["x"], a["y"]); pyautogui.moveTo(x, y, duration=0.15)
+            x, y = s.to_screen(a["x"], a["y"]); glide(x, y)
             pyautogui.click(clicks=2 if a.get("double") else 1, button="right" if str(a.get("button", "")).lower() == "right" else "left")
             return f"clicked ({a['x']},{a['y']})"
-        if k == "move": pyautogui.moveTo(*s.to_screen(a["x"], a["y"]), duration=0.2); return "moved"
+        if k == "move": glide(*s.to_screen(a["x"], a["y"])); return "moved"
         if k == "drag":
             x1, y1 = s.to_screen(a["x1"], a["y1"]); x2, y2 = s.to_screen(a["x2"], a["y2"])
-            pyautogui.moveTo(x1, y1, duration=0.15); pyautogui.mouseDown(); time.sleep(0.08)
+            glide(x1, y1); pyautogui.mouseDown(); time.sleep(0.05)
             pyautogui.moveTo(x2, y2, duration=min(1.5, 0.3 + math.hypot(x2 - x1, y2 - y1) / 1500)); time.sleep(0.08); pyautogui.mouseUp()
             return f"dragged ({a['x1']},{a['y1']})→({a['x2']},{a['y2']})"
         if k == "scroll":
-            pyautogui.moveTo(*s.to_screen(a.get("x", 0), a.get("y", 0)), duration=0.1); pyautogui.scroll(int(float(a.get("amount", 3))) * 120); return "scrolled"
+            glide(*s.to_screen(a.get("x", 0), a.get("y", 0))); pyautogui.scroll(int(float(a.get("amount", 3))) * 120); return "scrolled"
         if k == "type": keyboard.write(str(a.get("text", ""))[:2000], delay=0.01); return "typed text"
         if k == "key": keyboard.send(str(a.get("keys", ""))); return f"pressed {a.get('keys')}"
         if k == "wait": time.sleep(min(float(a.get("seconds", 1)), 5)); return "waited"
         return f"{k}: unknown"
 
-    def run_control(s, rid, acts, results):
+    def run_control(s, rid, acts, results, procs=()):
+        if procs: results.extend(wait_all(procs, s.stop_ev))
         for a in acts:
             if s.stop_ev.is_set() or rid != s.req or s.blocked(): results.append("stopped"); break
             try: results.append(s.control_one(a))
             except pyautogui.FailSafeException: s.stop_ev.set(); results.append("stopped: mouse hit a screen corner (fail-safe)"); break
             except Exception as ex: results.append(f"{a.get('do')}: failed ({ex})")
-            time.sleep(0.25)
+            time.sleep(0.04 if a.get("do") in ("move", "scroll") else 0.2)
         s.acts_done.emit(rid, results)
 
     def on_acts_done(s, rid, results):
