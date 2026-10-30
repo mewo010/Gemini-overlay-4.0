@@ -1,0 +1,66 @@
+# Save as: .github/workflows/discord-release.yml   (replace the old file, on your DEFAULT branch)
+# Needs a repo secret named DISCORD_WEBHOOK.
+name: Discord release announcement
+
+on:
+  release:
+    types: [published]
+  schedule:
+    - cron: "*/10 * * * *"     # catch-up: finds releases that were created by other workflows/tools and didn't fire the event
+  workflow_dispatch:            # manual test button (always sends)
+
+permissions:
+  contents: read
+
+jobs:
+  notify:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Find the latest published release
+        id: rel
+        env:
+          GH_TOKEN: ${{ github.token }}
+          EVENT: ${{ github.event_name }}
+        run: |
+          gh api "repos/${{ github.repository }}/releases?per_page=5" \
+            --jq '[.[] | select(.draft == false)][0]' > rel.json
+          TAG=$(jq -r '.tag_name // empty' rel.json)
+          if [ -z "$TAG" ]; then echo "No releases yet"; echo "send=false" >> "$GITHUB_OUTPUT"; exit 0; fi
+          AGE=$(( $(date +%s) - $(date -d "$(jq -r .published_at rel.json)" +%s) ))
+          # scheduled runs only announce releases from the last 6 hours; releases and manual tests always go through
+          if [ "$EVENT" = "schedule" ] && [ "$AGE" -gt 21600 ]; then echo "send=false" >> "$GITHUB_OUTPUT"; else echo "send=true" >> "$GITHUB_OUTPUT"; fi
+          echo "tag=$TAG" >> "$GITHUB_OUTPUT"
+
+      - name: Skip if this release was already announced
+        id: done
+        if: steps.rel.outputs.send == 'true'
+        uses: actions/cache@v4
+        with:
+          path: .announced
+          key: announced-${{ steps.rel.outputs.tag }}
+
+      - name: Send embed to Discord
+        if: steps.rel.outputs.send == 'true' && (steps.done.outputs.cache-hit != 'true' || github.event_name == 'workflow_dispatch')
+        env:
+          WEBHOOK: ${{ secrets.DISCORD_WEBHOOK }}
+          SITE: https://YOUR-NAME.pages.dev        # <- change to your site
+        run: |
+          [ -z "$WEBHOOK" ] && { echo "::error::Secret DISCORD_WEBHOOK is empty or missing"; exit 1; }
+          jq -n --slurpfile r rel.json --arg site "$SITE" '
+            $r[0] as $x | {
+              username: "AI Overlay Updates",
+              embeds: [{
+                title: ((if $x.prerelease then "🧪 Pre-release: " else "🚀 New update: " end) + $x.tag_name),
+                url: $site,
+                description: (($x.body // "") | .[0:900] | if . == "" then "Bug fixes and improvements." else . end),
+                color: 3890139,
+                fields: [
+                  {name: "⬇️ Download", value: "[Get the latest version](\($site))", inline: true},
+                  {name: "📝 Release notes", value: "[View on GitHub](\($x.html_url))", inline: true},
+                  {name: "Version", value: $x.tag_name, inline: true}
+                ],
+                footer: {text: "AI Overlay"},
+                timestamp: $x.published_at
+              }]
+            }' | curl -sS --fail -H "Content-Type: application/json" -d @- "$WEBHOOK"
+          touch .announced      # marks this release as done (saved to the cache after the job succeeds)
