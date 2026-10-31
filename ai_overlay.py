@@ -1802,7 +1802,7 @@ class MemoryPanel(QWidget):
             if q and q not in it["text"].lower(): continue
             ts = it.get("ts"); date = time.strftime("%b %d, %Y", time.localtime(ts)) if ts else "unknown date"
             note = "" if idx >= first_sent else "  ·  ⚠ not sent to the model (over budget)"
-            li = QListWidgetItem(f"{it["text"]}\n{date}{note}"); li.setData(Qt.ItemDataRole.UserRole, idx); s.lst.addItem(li)
+            li = QListWidgetItem(f"{it['text']}\n{date}{note}"); li.setData(Qt.ItemDataRole.UserRole, idx); s.lst.addItem(li)
             if idx in keep: li.setSelected(True)
         s.count.setText(f"{total} memor{'y' if total == 1 else 'ies'}" + (f"  ·  {s.lst.count()} shown" if q else ""))
         s.bar.setValue(min(100, int(used * 100 / limit))); s.budget.setText(
@@ -1944,6 +1944,7 @@ class SecretEdit(QWidget):
 class HotkeyEdit(QLineEdit):
     """Captures a shortcut with Qt key events (no global keyboard hook, so keys are never forwarded to other apps)."""
     captured = pyqtSignal(str)
+    rec = False; _prev = ""   # class defaults: Qt calls event() during super().__init__(), before instance attributes exist
     K = Qt.Key
     NAMES = {K.Key_Space.value: "space", K.Key_Return.value: "enter", K.Key_Enter.value: "enter", K.Key_Tab.value: "tab",
              K.Key_Backspace.value: "backspace", K.Key_Delete.value: "delete", K.Key_Insert.value: "insert", K.Key_Home.value: "home",
