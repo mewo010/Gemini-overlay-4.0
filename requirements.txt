@@ -1,8 +1,9 @@
 PyQt6
 requests
 keyboard
-sounddevice
 numpy
+sounddevice
 pyautogui
 cryptography
+uiautomation
 pyinstaller

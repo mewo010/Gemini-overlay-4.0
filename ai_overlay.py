@@ -47,6 +47,8 @@ from PyQt6.QtWidgets import (QApplication, QWidget, QFrame, QVBoxLayout, QHBoxLa
 FROZEN = getattr(sys, "frozen", False)
 BASE = os.path.dirname(sys.executable) if FROZEN else os.path.dirname(os.path.abspath(__file__))
 CFG_PATH = os.path.join(BASE, "config.json")
+APP_VERSION = "1.0.0"                  # must match your release tag without the v (v1.0.0 -> 1.0.0)
+GITHUB_REPO = "mewo010/Gemini-overlay-4.0"   # the app looks at this repo's GitHub Releases
 BUNDLED_CFG = os.path.join(getattr(sys, "_MEIPASS", BASE), "config.json")
 MEM_PATH = os.path.join(BASE, "memory.json")
 USAGE_PATH = os.path.join(BASE, "usage.json")
@@ -73,6 +75,11 @@ def make_provider(preset, **over):
     return d
 
 
+try:
+    import uiautomation as uia      # pip install uiautomation  (background control of apps without the mouse)
+except Exception:
+    uia = None
+
 DEFAULTS = {
     "providers": [],
     "effort": "low",
@@ -88,6 +95,9 @@ DEFAULTS = {
     "confirm_actions": False,        # ask before every mouse/keyboard/close-app action
     "max_tokens": 600,               # lower = less credit reserved per request (OpenRouter) and faster replies
     "max_steps": 8,                  # max observe-act rounds per request in Screen control mode
+    "auto_update": True, "skipped_version": "",
+    "music_service": "spotify",      # spotify | youtube: used when a request does not name a service
+    "spotify_client_id": "",         # Spotify Web API (hands-free playback); redirect URI http://127.0.0.1:8888/callback
 }
 HK_LABELS = [("hk_toggle", "Open / close overlay"), ("hk_summarize", "Summarize screen"),
              ("hk_area", "Select area"), ("hk_stop", "EMERGENCY STOP (cancel actions)")]
@@ -157,7 +167,9 @@ ACTIONS_DOC = """ACTIONS - to do something on the user's computer, write your sh
 - draw {shapes:[...], clear?, view?:[xmin,xmax,ymin,ymax]}: math coordinates, y up, default view x -10..10, y about -7..7.
   shapes: {"type":"triangle","points":[[0,0],[4,0],[2,3]],"labels":["A","B","C"],"color":"#8ab4f8","fill":"#8ab4f8"}, polygon {points} or {n,cx,cy,r},
   circle {cx,cy,r}, ellipse {cx,cy,rx,ry}, rect {x,y,w,h}, line {x1,y1,x2,y2}, point {x,y,label}, text {x,y,text}.
-- spotify {cmd:"pause"|"play"|"next"|"previous"|"restart"|"volume_up"|"volume_down"|"mute"} or {query:"song / artist / playlist"}: car-style music control. Transport commands are instant media keys (play/pause is a toggle). With a query, Spotify opens its search; with Screen control ON, then click the green Play button on the top result (or double-click the first song row). Say what you are playing.
+- spotify {cmd:"pause"|"play"|"next"|"previous"|"restart"|"volume_up"|"volume_down"|"mute"} or {query:"song / artist / playlist", kind?:"track|artist|playlist|album"}: music. Transport commands are instant media keys. A query plays it directly through the Spotify API in the background when connected (the result says "now playing"); otherwise it only opens the search and YOU must then click Play.
+- youtube {query}: free, no account: finds the first YouTube result and opens that video in the browser (normally starts playing by itself). Use it for "play X on YouTube" or when Spotify cannot play it.
+- ui_list {window}, ui_click {window,name}, ui_type {window,name?,text}: control an app through UI Automation. No mouse, no keyboard, no focus change, so the user can keep working. Use ui_list first to see the control names, then ui_click / ui_type. Works for most native apps; if the result says it can't, fall back to click/type.
 - move_window {monitor:"primary"|"secondary"|"secondary 2", title?:"part of the window title"}: move a window (default: the frontmost one) to another monitor. The result says "verified" or "NOT moved": report exactly that.
 Only when Screen control is ON:
 - click {x,y,button?:"left"|"right",double?:true}, move {x,y}, drag {x1,y1,x2,y2}, scroll {x,y,amount} (positive = up), type {text}, key {keys:"ctrl+l"}, wait {seconds}, observe {}.
@@ -166,7 +178,11 @@ RULES
 1. Monitors: the "Monitors" list tells you which display is Primary and which are Secondary. Coordinates always refer to the monitor in the screenshot. Never say a window/app was moved or opened unless the action result confirms it ("verified"); if it says NOT moved or failed, say so.
 2. Light mode: group steps. Never emit a "move" right before a click/drag/scroll (those already move the cursor). Put every action you already know about in ONE block; avoid single-pixel nudges and needless wait/observe steps.
 3. After open_app / spotify the app is already waited for before you get results. Do not repeat the launch. If the result says it is still loading, use ONE wait {seconds:3}, then re-check; never spam commands or loop.
-4. Music requests: act immediately (spotify action), no clarifying questions unless the request is truly ambiguous."""
+4. Music requests: act immediately (spotify action), no clarifying questions unless the request is truly ambiguous.
+5. FINISH THE JOB: a task is done only when its final effect happened (music actually playing, message actually sent, file actually saved). Searching or opening is NOT finishing: keep going until a result or the screen confirms the final effect. Never end with "I searched..." when the user asked you to do something.
+6. Prefer background methods, in this order: dedicated actions (spotify, move_window, open_app) -> ui_list/ui_click/ui_type -> click/type with screenshots as the last resort. The user keeps working while you act; physical mouse/keyboard actions wait for them to pause.
+7. Speed: put every step you already know in ONE block; do not request another screenshot after an action whose result already confirms success.
+8. observe {monitor:"secondary"|"primary"} switches which monitor you see; requests that name another screen, or an app living on it, are targeted automatically."""
 
 SUMMARY_PROMPT = ("Summarize what's on this screen: one line saying what it is, then 3-5 key points. "
                   "Read-only summary: do not suggest or perform actions.")
@@ -701,21 +717,24 @@ def _window_ready(proc):
     return False
 
 
+def _wait_one(proc, kind, stop_ev, timeout):
+    end = time.time() + timeout; ok = True
+    if proc:
+        ok = False
+        while time.time() < end and not stop_ev.is_set():
+            if _window_ready(proc): ok = True; break
+            time.sleep(0.35)
+        if ok: time.sleep(0.5)
+    else: time.sleep(1.2 if kind == "browser" else 1.8)
+    return f"{kind} is loaded and ready" if ok else f"{kind} is still loading after {int(timeout)}s - wait, do not repeat the command"
+
+
 def wait_all(procs, stop_ev, timeout=12.0):
-    """Blocking (run in a thread): wait until each launched app is loaded and responsive. Returns result notes."""
-    notes = []
-    for proc, kind in procs:
-        end = time.time() + timeout; ok = True
-        if proc:
-            ok = False
-            while time.time() < end and not stop_ev.is_set():
-                if _window_ready(proc): ok = True; break
-                time.sleep(0.5)
-            if ok: time.sleep(0.8)                                         # let the UI settle after the window appears
-        else: time.sleep(1.8 if kind == "browser" else 2.5)
-        notes.append(f"{kind} is loaded and ready" if ok else f"{kind} is still loading after {int(timeout)}s - wait, do not repeat the command")
-        if stop_ev.is_set(): break
-    return notes
+    """Blocking (run in a thread): wait for ALL launched apps in parallel until each is loaded and responsive."""
+    if not procs: return []
+    from concurrent.futures import ThreadPoolExecutor
+    with ThreadPoolExecutor(len(procs)) as ex:
+        return list(ex.map(lambda pk: _wait_one(pk[0], pk[1], stop_ev, timeout), procs))
 
 
 # ---------- Spotify / media keys (car-infotainment style) ----------
@@ -740,6 +759,10 @@ def fast_media(text):
     t = re.sub(r" (?:please|now)$", "", t)
     for pat, cmd in _FAST:
         if re.fullmatch(pat, t): return {"do": "spotify", "cmd": cmd}
+    m = re.fullmatch(r"(?:play|put on|start)\s+(.+?)\s+(?:on|in|using|with)\s+(spotify|youtube)", t)
+    if m: return {"do": m.group(2), "query": m.group(1).strip()}
+    m = re.fullmatch(r"(spotify|youtube)\s+play\s+(.+)", t)
+    if m: return {"do": m.group(1), "query": m.group(2).strip()}
     return None
 
 
@@ -749,8 +772,8 @@ def spotify_do(a, screen_on=False):
     if q:
         try: os.startfile("spotify:search:" + urllib.parse.quote(q)); launched = ("Spotify.exe", "spotify")
         except Exception: webbrowser.open("https://open.spotify.com/search/" + urllib.parse.quote(q)); launched = ("", "browser")
-        hint = ("click the green Play button on the top result" if screen_on else
-                "Screen control is OFF, so I can't press play; tell the user to switch it on or press play on the top result")
+        hint = ("click Play on the top result, then confirm the Pause icon shows (it is really playing)" if screen_on else
+                "Screen control is OFF, so I can't press play; tell the user to switch it on, or add a Spotify Client ID in Settings for hands-free playback")
         return f"opened Spotify search for “{q}”; {hint}", launched
     if cmd in MEDIA_KEYS:
         try: keyboard.send(MEDIA_KEYS[cmd])
@@ -776,6 +799,259 @@ def glide(x, y):
     pyautogui.moveTo(x, y, duration=0 if d < 4 else min(0.3, 0.04 + d / 5000), tween=pyautogui.easeOutQuad)
 
 
+# ---------- background control: user-idle yield, UI Automation, Spotify Web API, monitor targeting ----------
+import ctypes
+
+
+class _LII(ctypes.Structure): _fields_ = [("cbSize", ctypes.c_uint), ("dwTime", ctypes.c_uint)]
+
+
+_inj = [0]
+
+
+def _tick(): return ctypes.windll.kernel32.GetTickCount() if sys.platform == "win32" else 0
+
+
+def mark_injected(): _inj[0] = _tick()
+
+
+def _idle_ms():
+    """Milliseconds since the last REAL user input (input we injected ourselves is ignored)."""
+    if sys.platform != "win32": return 99999
+    li = _LII(); li.cbSize = ctypes.sizeof(li)
+    if not ctypes.windll.user32.GetLastInputInfo(ctypes.byref(li)): return 99999
+    if li.dwTime <= _inj[0] + 150: return 99999
+    return (_tick() - li.dwTime) & 0xFFFFFFFF
+
+
+def wait_user_idle(stop_ev, need=450, timeout=12.0):
+    """Never type/click over the user: wait until they pause, so they can keep working meanwhile."""
+    end = time.time() + timeout
+    while _idle_ms() < need:
+        if stop_ev.is_set() or time.time() > end: return False
+        time.sleep(0.08)
+    return True
+
+
+INTERACTIVE = {"ButtonControl", "MenuItemControl", "EditControl", "CheckBoxControl", "ListItemControl", "TabItemControl",
+               "HyperlinkControl", "ComboBoxControl", "RadioButtonControl", "SplitButtonControl", "TreeItemControl"}
+
+
+def _uia_window(title):
+    w = uia.WindowControl(searchDepth=1, SubName=str(title))
+    if not w.Exists(1.2, 0.2): raise RuntimeError(f"no window matching '{title}'")
+    return w
+
+
+def _uia_find(title, name, edit=False):
+    w = _uia_window(title); n = str(name or "").lower()
+    for c, _d in uia.WalkControl(w, maxDepth=12):
+        if edit and c.ControlTypeName == "EditControl" and (not n or n in (c.Name or "").lower()): return c
+        if not edit and c.ControlTypeName in INTERACTIVE and n and n in (c.Name or "").lower(): return c
+    raise RuntimeError(f"no {'text field' if edit else 'control'} '{name}' in '{title}'")
+
+
+def ui_job(a):
+    """UI Automation (no mouse, no keyboard, no focus change). Returns (message, look_flag)."""
+    if uia is None: return "ui_*: install the 'uiautomation' package (pip install uiautomation)", False
+    k = a["do"]; title = a.get("window", "")
+    try: ctx = uia.UIAutomationInitializerInThread()
+    except Exception: ctx = None
+    try:
+        if ctx is not None: ctx.__enter__()
+        if k == "ui_list":
+            w = _uia_window(title); out = []
+            for c, _d in uia.WalkControl(w, maxDepth=9):
+                if c.ControlTypeName in INTERACTIVE and (c.Name or c.ControlTypeName == "EditControl") and not c.IsOffscreen:
+                    out.append(f"{c.ControlTypeName[:-7]}: {(c.Name or '')[:50]}")
+                    if len(out) >= 50: break
+            return (f"controls in '{title}':\n" + "\n".join(out)) if out else f"no accessible controls in '{title}' (the app may not expose UI Automation)", "text"
+        if k == "ui_click":
+            c = _uia_find(title, a.get("name", ""))
+            for getter, act in (("GetInvokePattern", "Invoke"), ("GetSelectionItemPattern", "Select"), ("GetTogglePattern", "Toggle"), ("GetExpandCollapsePattern", "Expand")):
+                p = getattr(c, getter)()
+                if p: getattr(p, act)(); return f"clicked '{(c.Name or '')[:40]}' in the background", False
+            return f"'{(c.Name or '')[:40]}' can't be triggered without the mouse; use click instead", "text"
+        if k == "ui_type":
+            c = _uia_find(title, a.get("name", ""), edit=True); p = c.GetValuePattern()
+            if not p: return "that field doesn't accept direct text; use type instead", "text"
+            p.SetValue(str(a.get("text", ""))); return f"typed into '{(c.Name or 'text field')[:40]}' in the background", False
+        return f"{k}: unknown", False
+    except Exception as ex: return f"{k}: failed ({ex})", "text"
+    finally:
+        if ctx is not None:
+            try: ctx.__exit__(None, None, None)
+            except Exception: pass
+
+
+class SpotifyAPI:
+    """Spotify Web API with PKCE (no client secret). Plays things directly, in the background; needs Premium for playback control."""
+    AUTH, TOKEN, API = "https://accounts.spotify.com/authorize", "https://accounts.spotify.com/api/token", "https://api.spotify.com/v1"
+    REDIRECT = "http://127.0.0.1:8888/callback"
+    SCOPE = "user-modify-playback-state user-read-playback-state user-read-currently-playing"
+
+    def __init__(s, cfg):
+        s.cfg = cfg; s.path = os.path.join(BASE, "spotify_token.json"); s.tok = {}
+        try: s.tok = json.load(open(s.path, encoding="utf-8"))
+        except Exception: pass
+
+    def enabled(s): return bool(str(s.cfg.get("spotify_client_id", "")).strip())
+
+    def _store(s, j):
+        s.tok = {**s.tok, **j, "exp": time.time() + int(j.get("expires_in", 3600)) - 30}
+        try: json.dump(s.tok, open(s.path, "w", encoding="utf-8"))
+        except Exception: pass
+
+    def _post(s, data):
+        r = SESSION.post(s.TOKEN, data=data, timeout=15)
+        if r.status_code >= 400: raise RuntimeError(f"Spotify login failed ({r.status_code})")
+        s._store(r.json())
+
+    def login(s):
+        import secrets, hashlib, http.server, urllib.parse
+        cid = str(s.cfg["spotify_client_id"]).strip(); ver = secrets.token_urlsafe(64)[:100]; state = secrets.token_urlsafe(8); box = {}
+        chal = base64.urlsafe_b64encode(hashlib.sha256(ver.encode()).digest()).rstrip(b"=").decode()
+
+        class H(http.server.BaseHTTPRequestHandler):
+            def do_GET(h):
+                q = urllib.parse.parse_qs(urllib.parse.urlparse(h.path).query); box["code"] = q.get("code", [None])[0]; box["state"] = q.get("state", [None])[0]
+                h.send_response(200); h.send_header("Content-Type", "text/html; charset=utf-8"); h.end_headers()
+                h.wfile.write(b"<h2>Spotify connected. You can close this tab.</h2>")
+            def log_message(h, *a): pass
+        srv = http.server.HTTPServer(("127.0.0.1", 8888), H); srv.timeout = 120
+        webbrowser.open(s.AUTH + "?" + urllib.parse.urlencode({"client_id": cid, "response_type": "code", "redirect_uri": s.REDIRECT, "scope": s.SCOPE,
+                                                                  "code_challenge_method": "S256", "code_challenge": chal, "state": state}))
+        try: srv.handle_request()
+        finally: srv.server_close()
+        if not box.get("code") or box.get("state") != state: raise RuntimeError("Spotify login was cancelled or timed out")
+        s._post({"grant_type": "authorization_code", "code": box["code"], "redirect_uri": s.REDIRECT, "client_id": cid, "code_verifier": ver})
+
+    def access(s):
+        if s.tok.get("access_token") and time.time() < s.tok.get("exp", 0): return s.tok["access_token"]
+        if s.tok.get("refresh_token"):
+            try: s._post({"grant_type": "refresh_token", "refresh_token": s.tok["refresh_token"], "client_id": str(s.cfg["spotify_client_id"]).strip()}); return s.tok["access_token"]
+            except Exception: pass
+        s.login(); return s.tok["access_token"]
+
+    def call(s, method, path, **kw):
+        for _ in range(2):
+            r = SESSION.request(method, s.API + path, headers={"Authorization": "Bearer " + s.access()}, timeout=12, **kw)
+            if r.status_code != 401: return r
+            s.tok["exp"] = 0
+        return r
+
+    def device(s, stop_ev):
+        """Pick the active (or first) device; start the Spotify app and wait for it if none is up."""
+        launched = False; end = time.time() + 14
+        while time.time() < end and not stop_ev.is_set():
+            r = s.call("GET", "/me/player/devices")
+            devs = r.json().get("devices", []) if r.status_code == 200 else []
+            if devs: return next((d for d in devs if d.get("is_active")), devs[0])["id"]
+            if not launched:
+                launched = True
+                try: os.startfile("spotify:")
+                except Exception: pass
+            time.sleep(0.7)
+        raise RuntimeError("no Spotify device found - open the Spotify app and log in")
+
+    def play(s, query, kind, stop_ev):
+        kind = kind if kind in ("track", "artist", "playlist", "album") else "track"
+        r = s.call("GET", "/search", params={"q": query, "type": kind, "limit": 1})
+        if r.status_code != 200: raise RuntimeError(f"search failed ({r.status_code})")
+        items = [i for i in r.json().get(kind + "s", {}).get("items", []) if i]
+        if not items: raise RuntimeError(f"nothing found for '{query}'")
+        it = items[0]; name = it["name"] + (" - " + it["artists"][0]["name"] if kind == "track" and it.get("artists") else "")
+        dev = s.device(stop_ev)
+        r = s.call("PUT", "/me/player/play", params={"device_id": dev}, json={"uris": [it["uri"]]} if kind == "track" else {"context_uri": it["uri"]})
+        if r.status_code == 403: raise RuntimeError("Spotify Premium is required for remote playback")
+        if r.status_code >= 300: raise RuntimeError(f"play failed ({r.status_code})")
+        return f"now playing {name} on Spotify"
+
+
+def spotify_job(app, a, screen_on):
+    q = str(a.get("query", "")).strip(); kind = str(a.get("kind", "")).lower() or ("playlist" if "playlist" in q.lower() else "track")
+    try: return app.sp_api().play(q, kind, app.stop_ev), False
+    except Exception as ex:
+        m, _ = spotify_do({"query": q}, screen_on)            # fallback: open the search; the model then finishes it on screen
+        return f"Spotify API unavailable ({ex}); {m}", bool(screen_on)
+
+
+def youtube_job(a, screen_on):
+    """Free, no account: find the first YouTube result and open that video directly (it normally starts by itself)."""
+    q = str(a.get("query", "")).strip()
+    try:
+        r = SESSION.get("https://www.youtube.com/results", params={"search_query": q, "hl": "en"}, timeout=10,
+                        headers={"User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 Chrome/124 Safari/537.36", "Accept-Language": "en-US,en;q=0.9"})
+        ids = re.findall(r'"videoRenderer":\{"videoId":"([\w-]{11})"', r.text) or re.findall(r'"videoId":"([\w-]{11})"', r.text)
+        if not ids: raise RuntimeError("no results")
+        vid = ids[0]; t = re.search(r'"videoId":"' + vid + r'".{0,600}?"title":\{"runs":\[\{"text":"(.*?)"\}', r.text, re.S)
+        try: title = json.loads('"' + t.group(1) + '"') if t else q
+        except Exception: title = q
+        webbrowser.open("https://www.youtube.com/watch?v=" + vid)
+        if screen_on: time.sleep(2.5)
+        return f"opened “{title[:60]}” on YouTube; verify it is playing, and if paused click the video once", bool(screen_on)
+    except Exception as ex:
+        webbrowser.open("https://www.youtube.com/results?search_query=" + urllib.parse.quote(q))
+        if screen_on: time.sleep(2.5)
+        return f"YouTube lookup failed ({ex}); opened the search instead - click the first video", bool(screen_on)
+
+
+def run_jobs(jobs, results):
+    flag = False
+    for j in jobs:
+        try: msg, f = j()
+        except Exception as ex: msg, f = f"failed ({ex})", False
+        results.append(msg)
+        if f is True: flag = True
+        elif f == "text" and flag is False: flag = "text"
+    return flag
+
+
+def _win_exe(h):
+    from ctypes import wintypes
+    k, u = ctypes.windll.kernel32, ctypes.windll.user32
+    k.OpenProcess.restype = wintypes.HANDLE; k.CloseHandle.argtypes = [wintypes.HANDLE]
+    k.QueryFullProcessImageNameW.argtypes = [wintypes.HANDLE, wintypes.DWORD, wintypes.LPWSTR, ctypes.POINTER(wintypes.DWORD)]
+    pid = wintypes.DWORD(); u.GetWindowThreadProcessId(h, ctypes.byref(pid))
+    hp = k.OpenProcess(0x1000, False, pid.value)
+    if not hp: return ""
+    try:
+        buf = ctypes.create_unicode_buffer(520); n = wintypes.DWORD(520)
+        ok = k.QueryFullProcessImageNameW(hp, 0, buf, ctypes.byref(n))
+        return os.path.basename(buf.value).lower() if ok else ""
+    finally: k.CloseHandle(hp)
+
+
+def window_screen(exes):
+    """Which monitor currently holds a window of one of these executables?"""
+    if sys.platform != "win32": return None
+    from ctypes import wintypes
+    r = wintypes.RECT()
+    for h, _t in _top_windows():
+        if _win_exe(h) in exes:
+            ctypes.windll.user32.GetWindowRect(h, ctypes.byref(r))
+            return screen_at_phys((r.left + r.right) // 2, (r.top + r.bottom) // 2)
+    return None
+
+
+def infer_target_screen(text):
+    """Pick the monitor a request is about: 'on my second screen' or an app that lives on another monitor."""
+    t = str(text or "").lower()
+    if not t or len(ordered_screens()) < 2: return None
+    scr = r"(?:monitor|screen|display)"
+    if re.search(r"\b(?:secondary|second|2nd|other|external|another)\s+" + scr, t): return pick_screen("secondary")
+    if re.search(r"\b(?:primary|main|first|1st)\s+" + scr, t): return pick_screen("primary")
+    for side in ("left", "right"):
+        if re.search(r"\b" + side + r"\s+" + scr, t): return pick_screen(side)
+    try:
+        for k, v in APPS.items():
+            if v[1] and re.search(r"\b" + re.escape(k) + r"\b", t):
+                sc = window_screen({v[1].lower()})
+                if sc: return sc
+    except Exception: pass
+    return None
+
+
 def force_foreground(w):
     """Windows refuses focus to background apps; without it the first click on a freshly shown window can be swallowed."""
     if sys.platform != "win32": return
@@ -794,7 +1070,7 @@ def grab_screen(sc=None):
     return sc, sc.grabWindow(0)
 
 
-def prep_image(pix, grid=False, maxw=1600):
+def prep_image(pix, grid=False, maxw=1280):
     """QPixmap -> QImage scaled for the model; optional labelled coordinate grid so the model can aim clicks."""
     img = pix.toImage(); img.setDevicePixelRatio(1.0)
     if img.width() > maxw: img = img.scaledToWidth(maxw, Qt.TransformationMode.SmoothTransformation)
@@ -813,7 +1089,7 @@ def prep_image(pix, grid=False, maxw=1600):
 
 def img_to_b64(img):
     ba = QByteArray(); buf = QBuffer(ba); buf.open(QBuffer.OpenModeFlag.WriteOnly)
-    img.save(buf, "JPEG", 75)
+    img.save(buf, "JPEG", 65)
     return base64.b64encode(bytes(ba)).decode()
 
 
@@ -1187,7 +1463,7 @@ CONTROL = {"click", "move", "drag", "scroll", "type", "key", "wait"}
 
 class Overlay(QWidget):
     partial = pyqtSignal(int, str); finished = pyqtSignal(int, bool); heard = pyqtSignal(int, str)
-    acts_done = pyqtSignal(int, object); note = pyqtSignal(str); open_settings = pyqtSignal(); served = pyqtSignal(int, str); launched = pyqtSignal(int, object, bool); fast = pyqtSignal(int, object, str)
+    acts_done = pyqtSignal(int, object); note = pyqtSignal(str); open_settings = pyqtSignal(); served = pyqtSignal(int, str); launched = pyqtSignal(int, object, object); fast = pyqtSignal(int, object, str)
     W, H_COMPACT, H_FULL = 820, 150, 540
 
     def __init__(s, cfg, memory, vault):
@@ -1373,11 +1649,11 @@ class Overlay(QWidget):
         """Hide the overlay, grab a fresh screenshot, restore the overlay (without taking focus), call cb(pix)."""
         was = s.isVisible() or s._stealth; tok = s.req
         if was: s.hide()
-        QTimer.singleShot(170 if was else 0, lambda: s._snap_done(cb, was, tok))
+        QTimer.singleShot(100 if was else 0, lambda: s._snap_done(cb, was, tok))
 
     def _snap_done(s, cb, was, tok=None):
         if tok is not None and tok != s.req: return          # overlay was closed / stopped meanwhile: don't re-show it
-        s._sc, pix = grab_screen(s.screen_now())
+        s._sc, pix = grab_screen(getattr(s, "target_scr", None) or s.screen_now())
         if was: s._stealth = False; s.show()
         cb(pix)
 
@@ -1412,9 +1688,10 @@ class Overlay(QWidget):
         if t: s.edit.clear(); s.user_ask(text=t)
 
     def user_ask(s, text=None, audio=None):
+        s.target_scr = infer_target_screen(text) if text else None           # auto-pick the monitor the request is about
         if text and not audio:
             fa = fast_media(text)
-            if fa: s.req += 1; s.fast_action(fa, text); return                    # instant, no model round-trip
+            if fa: s.req += 1; s.run_fast(fa, text); return                    # instant, no model round-trip
         if s.b_scr.isChecked():                                    # live mode: always a fresh screenshot
             s.set_state("thinking", "Looking at your screen…")
             s.snap_screen(lambda pix: s.ask(text=text, audio=audio, pix=pix, screen=True))
@@ -1435,6 +1712,7 @@ class Overlay(QWidget):
         else:
             sp += "\n\n" + ACTIONS_DOC
             sp += "\n\nMonitors (physical px):\n" + monitor_text(s._sc if screen else None)
+            sp += "\nWhen the user does not name a music service, use: " + str(s.cfg.get("music_service", "spotify")) + "."
             if screen:
                 sp += (f"\n\nScreen control: ON. The attached screenshot is {img.width()}x{img.height()} px with a labelled red coordinate grid; "
                        "all x,y values use that pixel space. Aim for the centre of the target.")
@@ -1551,13 +1829,13 @@ class Overlay(QWidget):
 
     # --- actions ---
     def handle_actions(s, rid, acts):
-        acts = acts[:12]; results, ctl, look, procs = [], [], False, []
+        acts = acts[:12]; results, ctl, look, procs, jobs = [], [], False, [], []
         for a in acts: a["do"] = str(a.get("do", "")).lower()
         acts = coalesce(acts)
         screen_on = s.b_scr.isChecked()
         if s.blocked():
             s.after(rid, ["refused: Settings is open - no automation runs while you edit settings"], False); return
-        risky = [a for a in acts if a["do"] in CONTROL or a["do"] in ("close_app", "move_window")]
+        risky = [a for a in acts if a["do"] in CONTROL or a["do"] in ("close_app", "move_window", "ui_click", "ui_type")]
         if s.cfg["confirm_actions"] and risky:
             desc = "\n".join(f"• {a['do']} {json.dumps({k: v for k, v in a.items() if k != 'do'})[:80]}" for a in risky)
             if QMessageBox.question(None, "Allow actions?", "The assistant wants to:\n" + desc) != QMessageBox.StandardButton.Yes:
@@ -1568,6 +1846,7 @@ class Overlay(QWidget):
                 if screen_on: ctl.append(a)
                 else: results.append(f"{k}: refused, Screen control is OFF")
             elif k == "observe":
+                if a.get("monitor") and pick_screen(a["monitor"]): s.target_scr = pick_screen(a["monitor"])
                 if screen_on: look = True
                 else: results.append("observe: refused, Screen control is OFF")
             elif k == "open_app":
@@ -1575,9 +1854,13 @@ class Overlay(QWidget):
                 if time.time() - _RECENT_OPEN.get(key, 0) < 8: results.append(f"open_app {key}: already launching, waiting for it - do not repeat"); continue
                 _RECENT_OPEN[key] = time.time(); results.append(s.do_local(a)); procs.append(launch_proc(key))
             elif k == "spotify":
-                msg, pr = spotify_do(a, screen_on); results.append(msg)
-                if pr: procs.append(pr)
-                if a.get("query") and screen_on: look = True
+                if a.get("query") and s.sp_api().enabled(): jobs.append(lambda a=a: spotify_job(s, a, screen_on))
+                else:
+                    msg, pr = spotify_do(a, screen_on); results.append(msg)
+                    if pr: procs.append(pr)
+                    if a.get("query") and screen_on: look = True
+            elif k == "youtube": jobs.append(lambda a=a: youtube_job(a, screen_on))
+            elif k in ("ui_list", "ui_click", "ui_type"): jobs.append(lambda a=a: ui_job(a))
             elif k == "move_window": results.append(move_window(a.get("monitor", "secondary"), str(a.get("title", ""))))
             else: results.append(s.do_local(a))
         if procs and screen_on: look = True                                         # fresh screenshot once the app is ready
@@ -1585,10 +1868,10 @@ class Overlay(QWidget):
             if pyautogui is None: results.append("control unavailable: pip install pyautogui"); s.after(rid, results, look); return
             s.set_state("thinking", "Working… (emergency stop: " + s.cfg["hk_stop"] + ")")
             s._stealth = True; s.hide()                            # get out of the way of clicks
-            threading.Thread(target=s.run_control, args=(rid, ctl, results, procs), daemon=True).start()
-        elif procs:
-            s.set_state("thinking", "Waiting for the app to load…")
-            threading.Thread(target=s.wait_then, args=(rid, procs, results, look), daemon=True).start()
+            threading.Thread(target=s.run_control, args=(rid, ctl, results, procs, jobs), daemon=True).start()
+        elif procs or jobs:
+            s.set_state("thinking", "Working…")
+            threading.Thread(target=s.wait_then, args=(rid, procs, results, look, jobs), daemon=True).start()
         else: s.after(rid, results, look)
 
     def do_local(s, a):
@@ -1607,15 +1890,33 @@ class Overlay(QWidget):
             return f"{k}: failed ({ex})"
         return f"{k}: unknown action"
 
-    def wait_then(s, rid, procs, results, look):
-        results.extend(wait_all(procs, s.stop_ev)); s.launched.emit(rid, results, look)
+    def sp_api(s):
+        if getattr(s, "_sp", None) is None: s._sp = SpotifyAPI(s.cfg)
+        return s._sp
+
+    def wait_then(s, rid, procs, results, look, jobs=()):
+        results.extend(wait_all(procs, s.stop_ev)); lk = run_jobs(jobs, results)
+        s.launched.emit(rid, results, True if (look is True or lk is True) else (lk or False))
 
     def on_launched(s, rid, results, look):
-        if rid == s.req: s.after(rid, results, look)
-        else: s._unstealth()
+        if rid != s.req: s._unstealth(); return
+        if look == "text": s.after_text(rid, results)
+        else: s.after(rid, results, bool(look))
+
+    def after_text(s, rid, results):
+        """Text-only continuation (UI Automation results): no screenshot, so it is much faster."""
+        if s.step < s.cfg["max_steps"] and not s.stop_ev.is_set() and rid == s.req:
+            s.step += 1
+            msg = "Action results:\n" + "\n".join("- " + r for r in results) + "\nContinue, or give a short final answer with no action block if finished."
+            s.set_state("thinking", f"Step {s.step}…"); s.ask(text=msg, screen=False, auto=True)
+        else: s._unstealth(); s.set_state("idle", (results[-1] if results else "Done")[:100])
+
+    def run_fast(s, a, text):
+        if a.get("query"): s.stop_ev.clear(); s.step = 0; s.set_state("thinking", "Playing…"); s.handle_actions(s.req, [dict(a)])
+        else: s.fast_action(a, text)
 
     def on_fast(s, rid, a, text):
-        if rid == s.req: s.fast_action(a, text)
+        if rid == s.req: s.run_fast(a, text)
 
     def fast_action(s, a, text):
         s.speaker.stop(); msg, _ = spotify_do(a)
@@ -1651,14 +1952,22 @@ class Overlay(QWidget):
         if k == "wait": time.sleep(min(float(a.get("seconds", 1)), 5)); return "waited"
         return f"{k}: unknown"
 
-    def run_control(s, rid, acts, results, procs=()):
+    def run_control(s, rid, acts, results, procs=(), jobs=()):
         if procs: results.extend(wait_all(procs, s.stop_ev))
+        if jobs: run_jobs(jobs, results)
+        start = pyautogui.position(); last = None
         for a in acts:
             if s.stop_ev.is_set() or rid != s.req or s.blocked(): results.append("stopped"); break
+            if a.get("do") in CONTROL and not wait_user_idle(s.stop_ev):          # you are typing/moving: never fight over the mouse
+                results.append(f"{a.get('do')}: skipped, you were using the mouse/keyboard"); continue
             try: results.append(s.control_one(a))
             except pyautogui.FailSafeException: s.stop_ev.set(); results.append("stopped: mouse hit a screen corner (fail-safe)"); break
             except Exception as ex: results.append(f"{a.get('do')}: failed ({ex})")
-            time.sleep(0.04 if a.get("do") in ("move", "scroll") else 0.2)
+            mark_injected(); last = pyautogui.position()
+            time.sleep(0.03 if a.get("do") in ("move", "scroll") else 0.12)
+        try:
+            if last is not None and pyautogui.position() == last and start != last: pyautogui.moveTo(start); mark_injected()   # give the cursor back
+        except Exception: pass
         s.acts_done.emit(rid, results)
 
     def on_acts_done(s, rid, results):
@@ -2014,6 +2323,8 @@ class Settings(QDialog):
         s.confirm = QCheckBox("Ask before every mouse / keyboard / close-app action")
         f1.addRow("Thinking effort", s.effort); f1.addRow("Auto-send after silence", s.sil); f1.addRow("Max reply tokens", s.maxtok)
         f1.addRow("Max steps (Screen control)", s.steps); f1.addRow("", s.confirm)
+        s.sp_id = QLineEdit(); s.sp_id.setPlaceholderText("Spotify Client ID (developer.spotify.com, redirect http://127.0.0.1:8888/callback)"); f1.addRow("Spotify API (Premium only)", s.sp_id)
+        s.music = QComboBox(); s.music.addItems(["spotify", "youtube"]); f1.addRow("Play music with", s.music)
         c2, f2, v2 = mk_card("Hotkeys", "Click Change, then press the new shortcut. Use a modifier (Ctrl / Alt / Shift / Win) or an F-key.")
         s.edits, s.btns = {}, {}
         for k, label in HK_LABELS:
@@ -2079,7 +2390,10 @@ class Settings(QDialog):
         bv = QPushButton("Open secure vault…"); bv.clicked.connect(lambda: open_vault_manager(s.app.vault)); v1.addWidget(bv, 0, Qt.AlignmentFlag.AlignLeft)
         c2, f2, v2 = mk_card("Files", "config.json, memory.json and vault.bin live next to the program.")
         bf = QPushButton("Open data folder"); bf.clicked.connect(s.open_folder); v2.addWidget(bf, 0, Qt.AlignmentFlag.AlignLeft)
-        return mk_page("Data", c1, c2)
+        c3, f3, v3 = mk_card("Updates", f"Version {APP_VERSION}. The app checks GitHub for a newer release and tells you.")
+        s.auto_upd = QCheckBox("Check for updates automatically"); f3.addRow("", s.auto_upd)
+        bu = QPushButton("Check now"); bu.clicked.connect(lambda: s.app.check_updates(manual=True)); v3.addWidget(bu, 0, Qt.AlignmentFlag.AlignLeft)
+        return mk_page("Data", c1, c2, c3)
 
     def open_folder(s):
         try: os.startfile(BASE)
@@ -2089,7 +2403,7 @@ class Settings(QDialog):
     def load(s):
         c = s.app.cfg
         s.effort.setCurrentText(c["effort"]); s.sil.setValue(float(c["silence"])); s.confirm.setChecked(c["confirm_actions"])
-        s.steps.setValue(int(c["max_steps"])); s.maxtok.setValue(int(c["max_tokens"]))
+        s.steps.setValue(int(c["max_steps"])); s.maxtok.setValue(int(c["max_tokens"])); s.sp_id.setText(c.get("spotify_client_id", "")); s.music.setCurrentText(c.get("music_service", "spotify")); s.auto_upd.setChecked(bool(c.get("auto_update", True)))
         for k, _ in HK_LABELS: s.edits[k].setText(c[k])
         s.provs = copy.deepcopy(c["providers"]); s.p_refresh()
         s.tts.setCurrentText(c["tts_provider"]); s.tkey.setText(c["tts_key"]); s.tvoice.setText(c["tts_voice"]); s.tmodel.setText(c["tts_model"]); s.turl.setText(c["tts_url"])
@@ -2200,7 +2514,7 @@ class Settings(QDialog):
             QMessageBox.warning(s, "Hotkey", "Two actions share the same hotkey."); return
         s.k_collect()
         s.app.cfg.update(providers=s.provs, effort=s.effort.currentText(), silence=round(s.sil.value(), 2),
-                         confirm_actions=s.confirm.isChecked(), max_steps=s.steps.value(), max_tokens=s.maxtok.value(), tts_provider=s.tts.currentText(),
+                         confirm_actions=s.confirm.isChecked(), spotify_client_id=s.sp_id.text().strip(), music_service=s.music.currentText(), auto_update=s.auto_upd.isChecked(), max_steps=s.steps.value(), max_tokens=s.maxtok.value(), tts_provider=s.tts.currentText(),
                          tts_key=s.tkey.text(), tts_voice=s.tvoice.text().strip(), tts_model=s.tmodel.text().strip(),
                          tts_url=s.turl.text().strip(), stt_mode=s.stt.currentText(), stt_url=s.surl.text().strip(),
                          stt_key=s.skey.text(), stt_model=s.smodel.text().strip(), display=s.disp.currentData() or "cursor", **combos)
@@ -2209,9 +2523,32 @@ class Settings(QDialog):
         s.app.apply_hotkeys(); s.app.ov.apply_display(); s.close()
 
 
+# ---------- update check (GitHub Releases) ----------
+def _vtuple(v): return tuple(int(x) for x in re.findall(r"\d+", str(v))[:4]) or (0,)
+
+
+def latest_release():
+    """Highest-numbered published release (drafts ignored) if it is newer than this app, else None."""
+    r = SESSION.get(f"https://api.github.com/repos/{GITHUB_REPO}/releases", params={"per_page": 15}, timeout=10, headers={"Accept": "application/vnd.github+json"})
+    r.raise_for_status()
+    rels = [j for j in r.json() if not j.get("draft") and j.get("tag_name")]
+    if not rels: return None
+    j = max(rels, key=lambda x: _vtuple(x["tag_name"])); tag = str(j["tag_name"])
+    if _vtuple(tag) > _vtuple(APP_VERSION): return {"version": tag.lstrip("vV"), "page": j.get("html_url"), "notes": str(j.get("body") or "")}
+    return None
+
+
+def delete_self_after_exit():
+    """Packaged .exe only: a hidden helper deletes this old exe as soon as the app has closed (settings/memory/vault files are kept)."""
+    if not FROZEN or sys.platform != "win32": return
+    exe = sys.executable
+    subprocess.Popen(f'for /l %i in (1,1,15) do (del /f /q "{exe}" >nul 2>&1 & if not exist "{exe}" exit /b & ping -n 2 127.0.0.1 >nul)',
+                     shell=True, creationflags=NO_WINDOW)
+
+
 # ---------- app controller ----------
 class App(QObject):
-    toggle = pyqtSignal(); summ = pyqtSignal(); area = pyqtSignal(); stop = pyqtSignal()
+    toggle = pyqtSignal(); summ = pyqtSignal(); area = pyqtSignal(); stop = pyqtSignal(); update_found = pyqtSignal(object)
 
     def __init__(s, qapp):
         super().__init__()
@@ -2226,11 +2563,45 @@ class App(QObject):
         p = QPainter(pm); p.setRenderHint(QPainter.RenderHint.Antialiasing)
         p.setBrush(QColor("#8ab4f8")); p.setPen(Qt.PenStyle.NoPen); p.drawEllipse(4, 4, 24, 24); p.end()
         s.tray = QSystemTrayIcon(QIcon(pm)); m = QMenu()
-        for label, fn in (("Open overlay", lambda: s.ov.open_overlay()), ("Canvas", s.ov.show_canvas), ("Settings", s.show_settings), ("Quit", qapp.quit)):
+        for label, fn in (("Open overlay", lambda: s.ov.open_overlay()), ("Canvas", s.ov.show_canvas), ("Check for updates", lambda: s.check_updates(manual=True)), ("Settings", s.show_settings), ("Quit", qapp.quit)):
             a = QAction(label, m); a.triggered.connect(lambda _, fn=fn: fn()); m.addAction(a)
         s.tray.setContextMenu(m); s.tray.setToolTip("AI Overlay"); s.tray.show(); s._menu = m
         s.apply_hotkeys()
+        s.update_found.connect(s.on_update_found)
+        QTimer.singleShot(5000, s.check_updates); s._ut = QTimer(s); s._ut.timeout.connect(s.check_updates); s._ut.start(6 * 3600 * 1000)
         if not s.ov.providers(): s.show_settings()
+
+    # ---------- updates ----------
+    def check_updates(s, manual=False):
+        if "YOUR_NAME" in GITHUB_REPO:
+            if manual: QMessageBox.information(None, "Updates", "Set GITHUB_REPO at the top of the script first (for example \"john/ai-overlay\").")
+            return
+        if not manual and (not FROZEN or not s.cfg.get("auto_update", True)): return      # no automatic nagging while running from source
+        threading.Thread(target=s._check_thread, args=(manual,), daemon=True).start()
+
+    def _check_thread(s, manual):
+        try: info = latest_release(); s.update_found.emit({"manual": manual, **info} if info else {"manual": manual, "uptodate": True})
+        except Exception as ex: s.update_found.emit({"manual": manual, "error": str(ex)})
+
+    def on_update_found(s, info):
+        manual = info.get("manual")
+        if info.get("error"):
+            if manual: QMessageBox.warning(None, "Updates", f"Couldn't check for updates:\n{info['error']}")
+            return
+        if info.get("uptodate"):
+            if manual: QMessageBox.information(None, "Updates", f"You're up to date (version {APP_VERSION}).")
+            return
+        v = str(info["version"])
+        if not manual and v == s.cfg.get("skipped_version"): return
+        box = QMessageBox(); box.setWindowTitle("Update available"); box.setWindowFlag(Qt.WindowType.WindowStaysOnTopHint)
+        old = "This old version will be deleted when the app closes. Save the new .exe in this same folder to keep your settings and memory." if FROZEN else ""
+        box.setText(f"A new version ({v}) is available. You have {APP_VERSION}.\n\n{info['notes'][:300]}\n\n{old}")
+        yes = box.addButton("Download new version", QMessageBox.ButtonRole.AcceptRole); box.addButton("Later", QMessageBox.ButtonRole.RejectRole)
+        skip = box.addButton("Skip this version", QMessageBox.ButtonRole.DestructiveRole); box.exec()
+        if box.clickedButton() is skip: s.cfg["skipped_version"] = v; save_cfg(s.cfg); return
+        if box.clickedButton() is not yes: return
+        webbrowser.open(str(info.get("page") or f"https://github.com/{GITHUB_REPO}/releases/latest"))
+        if FROZEN: delete_self_after_exit(); QGuiApplication.instance().quit()
 
     def on_screens_changed(s):
         s.settings.refresh_displays(); s.ov.apply_display()
