@@ -35,7 +35,7 @@ try:
 except Exception:
     Fernet = None
 from PyQt6.QtCore import (Qt, QRect, QRectF, QTimer, QObject, pyqtSignal, QPropertyAnimation,
-                          QParallelAnimationGroup, QEasingCurve, QBuffer, QByteArray, QPointF, QEvent)
+                          QParallelAnimationGroup, QEasingCurve, QBuffer, QByteArray, QPointF, QEvent, QSize)
 from PyQt6.QtGui import (QPainter, QColor, QPen, QCursor, QGuiApplication, QRadialGradient, QConicalGradient,
                          QIcon, QPixmap, QAction, QFont, QPolygonF, QPainterPath, QImage, QKeySequence)
 from PyQt6.QtWidgets import (QApplication, QWidget, QFrame, QVBoxLayout, QHBoxLayout, QLabel, QPushButton,
@@ -167,7 +167,7 @@ ACTIONS_DOC = """ACTIONS - to do something on the user's computer, write your sh
 - draw {shapes:[...], clear?, view?:[xmin,xmax,ymin,ymax]}: math coordinates, y up, default view x -10..10, y about -7..7.
   shapes: {"type":"triangle","points":[[0,0],[4,0],[2,3]],"labels":["A","B","C"],"color":"#8ab4f8","fill":"#8ab4f8"}, polygon {points} or {n,cx,cy,r},
   circle {cx,cy,r}, ellipse {cx,cy,rx,ry}, rect {x,y,w,h}, line {x1,y1,x2,y2}, point {x,y,label}, text {x,y,text}.
-- spotify {cmd:"pause"|"play"|"next"|"previous"|"restart"|"volume_up"|"volume_down"|"mute"} or {query:"song / artist / playlist", kind?:"track|artist|playlist|album"}: music. Transport commands are instant media keys. A query plays it directly through the Spotify API in the background when connected (the result says "now playing"); otherwise it only opens the search and YOU must then click Play.
+- spotify {cmd:"pause"|"play"|"ensure_playing"|"next"|"previous"|"restart"|"volume_up"|"volume_down"|"mute"} or {query:"song / artist / playlist", kind?:"track|artist|playlist|album"}: music. Transport commands are instant media keys and state-aware (play never pauses a song that is playing, pause never starts one). A query plays through the Spotify API if connected; otherwise it only opens the search and YOU must click. After you click Play on a playlist/album/track, or double-click a song row, END THE SAME BLOCK with {do:"spotify",cmd:"ensure_playing"}: it reads the real playing state, presses Play if it is still paused, and names what is playing. Opening or browsing a playlist is NOT playing.
 - youtube {query}: free, no account: finds the first YouTube result and opens that video in the browser (normally starts playing by itself). Use it for "play X on YouTube" or when Spotify cannot play it.
 - ui_list {window}, ui_click {window,name}, ui_type {window,name?,text}: control an app through UI Automation. No mouse, no keyboard, no focus change, so the user can keep working. Use ui_list first to see the control names, then ui_click / ui_type. Works for most native apps; if the result says it can't, fall back to click/type.
 - move_window {monitor:"primary"|"secondary"|"secondary 2", title?:"part of the window title"}: move a window (default: the frontmost one) to another monitor. The result says "verified" or "NOT moved": report exactly that.
@@ -766,7 +766,43 @@ def fast_media(text):
     return None
 
 
-def spotify_do(a, screen_on=False):
+def spotify_info():
+    """(state, title): True = playing, False = paused/idle, None = unknown. Free detection from Spotify's window title:
+    it is just 'Spotify Free/Premium' when idle and 'Artist - Song' while something plays."""
+    if sys.platform != "win32": return None, ""
+    try:
+        for h, title in _top_windows():
+            if _win_exe(h) != "spotify.exe": continue
+            t = title.strip()
+            if t.lower().startswith(("gdi+", "chrome legacy", "default ime", "msctfime", "spotify widget")): continue
+            return (t.lower() not in ("", "spotify", "spotify free", "spotify premium")), t
+    except Exception: pass
+    return None, ""
+
+
+def spotify_state(): return spotify_info()[0]
+
+
+def _wait_state(want, secs, stop_ev):
+    end = time.time() + secs
+    while time.time() < end and not (stop_ev and stop_ev.is_set()):
+        if spotify_state() is want: return True
+        time.sleep(0.2)
+    return spotify_state() is want
+
+
+def spotify_ensure_playing(stop_ev=None):
+    """Make sure music is REALLY playing: give the click time to register, press Play only if still paused, then verify."""
+    if _wait_state(True, 1.6, stop_ev): return f"spotify: playing '{spotify_info()[1][:60]}' (verified)"
+    if spotify_state() is None: return "spotify: can't read Spotify's state (window hidden?); look at the screen and click Play if it is paused"
+    for _ in range(2):
+        try: keyboard.send("play/pause media")
+        except Exception as ex: return f"spotify play: failed ({ex})"
+        if _wait_state(True, 1.8, stop_ev): return f"spotify: playing '{spotify_info()[1][:60]}' (started with the Play key; check it is the song that was asked for)"
+    return "spotify: still paused after pressing Play twice; click the green Play button on the screen"
+
+
+def spotify_do(a, screen_on=False, stop_ev=None):
     """Returns (result message, launched (proc, kind) or None)."""
     cmd = str(a.get("cmd", "")).lower().strip(); q = str(a.get("query", "")).strip()
     if q:
@@ -775,6 +811,8 @@ def spotify_do(a, screen_on=False):
         hint = ("click Play on the top result, then confirm the Pause icon shows (it is really playing)" if screen_on else
                 "Screen control is OFF, so I can't press play; tell the user to switch it on, or add a Spotify Client ID in Settings for hands-free playback")
         return f"opened Spotify search for “{q}”; {hint}", launched
+    if cmd in ("play", "resume", "ensure_playing"): return spotify_ensure_playing(stop_ev), None
+    if cmd == "pause" and spotify_state() is False: return "spotify: already paused", None
     if cmd in MEDIA_KEYS:
         try: keyboard.send(MEDIA_KEYS[cmd])
         except Exception as ex: return f"spotify {cmd}: failed ({ex})", None
@@ -1853,6 +1891,9 @@ class Overlay(QWidget):
                 key = _norm(str(a.get("name", "")))
                 if time.time() - _RECENT_OPEN.get(key, 0) < 8: results.append(f"open_app {key}: already launching, waiting for it - do not repeat"); continue
                 _RECENT_OPEN[key] = time.time(); results.append(s.do_local(a)); procs.append(launch_proc(key))
+            elif k == "spotify" and a.get("cmd") in ("ensure_playing", "play", "resume") and not a.get("query"):
+                if ctl: ctl.append(a)                                              # keep order: run AFTER the clicks before it
+                else: jobs.append(lambda a=a: (spotify_do(a, screen_on, s.stop_ev)[0], False))
             elif k == "spotify":
                 if a.get("query") and s.sp_api().enabled(): jobs.append(lambda a=a: spotify_job(s, a, screen_on))
                 else:
@@ -1935,6 +1976,7 @@ class Overlay(QWidget):
 
     def control_one(s, a):
         k = a["do"]
+        if k == "spotify": return spotify_do(a, True, s.stop_ev)[0]
         if k == "click":
             x, y = s.to_screen(a["x"], a["y"]); glide(x, y)
             pyautogui.click(clicks=2 if a.get("double") else 1, button="right" if str(a.get("button", "")).lower() == "right" else "left")
@@ -2027,7 +2069,7 @@ DARK = """
 
 class ProviderDialog(QDialog):
     def __init__(s, p=None, parent=None):
-        super().__init__(parent); s.setWindowTitle("Model provider"); s.setMinimumWidth(560); s.setStyleSheet(DARK); s.result_p = None
+        super().__init__(parent); s.setWindowTitle("Model provider"); s.setMinimumWidth(560); s.setStyleSheet(SETTINGS_QSS); s.result_p = None
         f = QFormLayout(s)
         s.preset = QComboBox(); s.preset.addItems(list(PRESETS))
         s.name = QLineEdit(); s.url = QLineEdit(); s.url.setPlaceholderText("https://…/v1/chat/completions (OpenAI-compatible)")
@@ -2160,7 +2202,7 @@ class MemoryDialog(QDialog):
 class VaultDialog(QDialog):
     def __init__(s, vault, key, entries):
         super().__init__(); s.vault, s.key, s.entries = vault, key, entries
-        s.setWindowTitle("Secure vault (auto-locks in 3 min)"); s.setMinimumWidth(480); s.setStyleSheet(DARK)
+        s.setWindowTitle("Secure vault (auto-locks in 3 min)"); s.setMinimumWidth(480); s.setStyleSheet(SETTINGS_QSS)
         lay = QVBoxLayout(s); s.lst = QListWidget(); lay.addWidget(s.lst)
         f = QFormLayout(); s.label = QLineEdit(); s.user = QLineEdit(); s.secret = QLineEdit(); s.secret.setEchoMode(QLineEdit.EchoMode.Password); s.note = QLineEdit()
         show = QCheckBox("Show secret"); show.toggled.connect(lambda on: s.secret.setEchoMode(QLineEdit.EchoMode.Normal if on else QLineEdit.EchoMode.Password))
@@ -2201,36 +2243,75 @@ def open_vault_manager(vault):
     VaultDialog(vault, key, entries).exec()
 
 
-SETTINGS_QSS = DARK + """
-    #nav{background:#1a1b1e;border:none;border-radius:12px;padding:6px;outline:0}
-    #nav::item{color:#c4c7c5;padding:10px 12px;border-radius:8px;margin:2px 0}
-    #nav::item:selected{background:#3b5bdb;color:#fff} #nav::item:hover:!selected{background:#2a2b2e}
-    QFrame#card{background:#26282b;border:1px solid #34373b;border-radius:12px}
-    QLabel#h1{font:600 20px 'Segoe UI';color:#fff} QLabel#h2{font:600 14px 'Segoe UI';color:#fff}
-    QLabel#hint{color:#9aa0a6;font:12px 'Segoe UI'}
-    QProgressBar{background:#303134;border:none;border-radius:4px} QProgressBar::chunk{background:#8ab4f8;border-radius:4px}
-    QPushButton#danger{background:#5c2b2b} QPushButton#danger:hover{background:#7a3535}
-    QListWidget::item{padding:6px;border-radius:6px} QListWidget::item:selected{background:#3b5bdb;color:#fff}
-    QScrollBar:vertical{background:transparent;width:10px} QScrollBar::handle:vertical{background:#3c4043;border-radius:5px;min-height:30px}
-    QScrollBar::add-line,QScrollBar::sub-line{height:0}"""
+SETTINGS_QSS = """
+    QDialog{background:#14161b}
+    QLabel,QCheckBox{color:#e6e9f2;font:13px 'Segoe UI'}
+    QLabel#brand{font:700 18px 'Segoe UI';color:#fff} QLabel#ver{color:#6f778c;font:11px 'Segoe UI'}
+    QLabel#h1{font:700 23px 'Segoe UI';color:#fff} QLabel#sub{color:#8b93a7;font:13px 'Segoe UI'}
+    QLabel#h2{font:600 14px 'Segoe UI';color:#fff} QLabel#hint{color:#8b93a7;font:12px 'Segoe UI'}
+    QFrame#side{background:#0e1015;border:1px solid #1d2029;border-radius:16px}
+    QFrame#card{background:#1a1d25;border:1px solid #272b38;border-radius:14px}
+    QFrame#sep{background:#242836;border:none}
+    #nav{background:transparent;border:none;outline:0}
+    #nav::item{color:#aab1c5;padding:11px 14px;border-radius:10px;margin:2px 0;font:13px 'Segoe UI'}
+    #nav::item:hover:!selected{background:#181b24}
+    #nav::item:selected{background:#222a55;color:#fff}
+    QLineEdit,QComboBox,QDoubleSpinBox,QSpinBox{background:#0f1116;color:#e6e9f2;border:1px solid #2a2e3b;border-radius:9px;padding:7px 10px;font:13px 'Segoe UI';selection-background-color:#5b7cfa}
+    QLineEdit:focus,QComboBox:focus,QDoubleSpinBox:focus,QSpinBox:focus{border:1px solid #5b7cfa}
+    QLineEdit:read-only{color:#c9d1ff}
+    QComboBox::drop-down{border:none;width:26px}
+    QComboBox QAbstractItemView{background:#1b1e27;color:#e6e9f2;border:1px solid #2a2e3b;selection-background-color:#2c3560;outline:0;padding:4px}
+    QPushButton{background:#232733;color:#e6e9f2;border:1px solid #2f3445;border-radius:9px;padding:7px 16px;font:13px 'Segoe UI'}
+    QPushButton:hover{background:#2b3040} QPushButton:pressed{background:#1d2130}
+    QPushButton#save{background:qlineargradient(x1:0,y1:0,x2:1,y2:0,stop:0 #5b7cfa,stop:1 #8b6cff);border:none;color:#fff;font:600 13px 'Segoe UI';padding:8px 24px}
+    QPushButton#save:hover{background:qlineargradient(x1:0,y1:0,x2:1,y2:0,stop:0 #6f8cff,stop:1 #9a7dff)}
+    QPushButton#ghost{background:transparent;border:none;color:#aab1c5} QPushButton#ghost:hover{color:#fff}
+    QPushButton#danger{background:#4a2428;border:1px solid #6b2f35} QPushButton#danger:hover{background:#63303a}
+    QListWidget{background:#0f1116;color:#e6e9f2;border:1px solid #2a2e3b;border-radius:10px;padding:4px;font:13px 'Segoe UI'}
+    QListWidget::item{padding:7px 8px;border-radius:7px} QListWidget::item:selected{background:#2c3560;color:#fff}
+    QProgressBar{background:#262a37;border:none;border-radius:4px;max-height:8px} QProgressBar::chunk{background:#5b7cfa;border-radius:4px}
+    QScrollBar:vertical{background:transparent;width:10px;margin:2px} QScrollBar::handle:vertical{background:#303546;border-radius:5px;min-height:30px}
+    QScrollBar::handle:vertical:hover{background:#41475c} QScrollBar::add-line,QScrollBar::sub-line{height:0}
+    QToolTip{background:#1b1e27;color:#e6e9f2;border:1px solid #2a2e3b;padding:5px}"""
+
+
+PAGE_SUB = {"General": "Behavior, music and hotkeys", "Providers": "The AI models the assistant can use", "API keys": "Keys for voice and online services",
+            "Voice": "How the assistant listens and speaks", "Display": "Where the overlay appears", "Memory": "What the assistant remembers about you",
+            "Data": "Your files, vault and updates"}
 
 
 def mk_card(title, hint=None):
-    f = QFrame(); f.setObjectName("card"); v = QVBoxLayout(f); v.setContentsMargins(16, 14, 16, 14); v.setSpacing(10)
+    f = QFrame(); f.setObjectName("card"); v = QVBoxLayout(f); v.setContentsMargins(20, 16, 20, 18); v.setSpacing(12)
     t = QLabel(title); t.setObjectName("h2"); v.addWidget(t)
     if hint: h = QLabel(hint); h.setObjectName("hint"); h.setWordWrap(True); v.addWidget(h)
-    form = QFormLayout(); form.setHorizontalSpacing(16); form.setVerticalSpacing(10)
+    form = QFormLayout(); form.setHorizontalSpacing(20); form.setVerticalSpacing(12); form.setLabelAlignment(Qt.AlignmentFlag.AlignLeft | Qt.AlignmentFlag.AlignVCenter)
     form.setFieldGrowthPolicy(QFormLayout.FieldGrowthPolicy.ExpandingFieldsGrow); v.addLayout(form)
     return f, form, v
 
 
 def mk_page(title, *cards):
     sa = QScrollArea(); sa.setWidgetResizable(True); sa.setFrameShape(QFrame.Shape.NoFrame)
-    inner = QWidget(); v = QVBoxLayout(inner); v.setContentsMargins(0, 0, 8, 0); v.setSpacing(12)
+    inner = QWidget(); v = QVBoxLayout(inner); v.setContentsMargins(4, 2, 12, 8); v.setSpacing(14)
     h = QLabel(title); h.setObjectName("h1"); v.addWidget(h)
+    if title in PAGE_SUB: sub = QLabel(PAGE_SUB[title]); sub.setObjectName("sub"); v.addWidget(sub); v.addSpacing(4)
     for c in cards: v.addWidget(c)
     v.addStretch(); sa.setWidget(inner); sa.viewport().setAutoFillBackground(False); inner.setAutoFillBackground(False)
     return sa
+
+
+class Switch(QCheckBox):
+    """Modern on/off toggle that replaces the plain checkbox."""
+    def __init__(s, text=""): super().__init__(text); s.setCursor(Qt.CursorShape.PointingHandCursor)
+    def sizeHint(s): return QSize(46 + (s.fontMetrics().horizontalAdvance(s.text()) + 12 if s.text() else 0), 28)
+    def hitButton(s, pos): return s.rect().contains(pos)
+
+    def paintEvent(s, e):
+        p = QPainter(s); p.setRenderHint(QPainter.RenderHint.Antialiasing); on = s.isChecked(); h = s.height()
+        p.setPen(Qt.PenStyle.NoPen); p.setBrush(QColor("#5b7cfa" if on else "#3a3f52")); p.drawRoundedRect(QRectF(0, (h - 20) / 2, 38, 20), 10, 10)
+        p.setBrush(QColor("#ffffff")); p.drawEllipse(QRectF(20 if on else 2, (h - 16) / 2, 16, 16))
+        if s.text():
+            p.setPen(QColor("#e6e9f2" if s.isEnabled() else "#6f778c")); p.setFont(s.font())
+            p.drawText(QRectF(50, 0, s.width() - 50, h), int(Qt.AlignmentFlag.AlignVCenter | Qt.AlignmentFlag.AlignLeft), s.text())
 
 
 def hint_label(text):
@@ -2296,19 +2377,26 @@ class HotkeyEdit(QLineEdit):
 
 class Settings(QDialog):
     PAGES = ["General", "Providers", "API keys", "Voice", "Display", "Memory", "Data"]
+    ICONS = {"General": "⚙", "Providers": "🧠", "API keys": "🔑", "Voice": "🎙", "Display": "🖥", "Memory": "💾", "Data": "📦"}
 
     def __init__(s, app):
         super().__init__(); s.app = app; s.recording = None; s.provs = []; s.krows = []; s._ids = []
-        s.setWindowTitle("AI Overlay - Settings"); s.setMinimumSize(780, 540); s.resize(880, 620); s.setStyleSheet(SETTINGS_QSS)
-        root = QVBoxLayout(s); root.setContentsMargins(14, 14, 14, 12); root.setSpacing(10)
-        body = QHBoxLayout(); body.setSpacing(14); root.addLayout(body, 1)
-        s.nav = QListWidget(); s.nav.setObjectName("nav"); s.nav.setFixedWidth(168); s.nav.addItems(s.PAGES); body.addWidget(s.nav)
+        s.setWindowTitle("AI Overlay - Settings"); s.setMinimumSize(860, 580); s.resize(960, 660); s.setStyleSheet(SETTINGS_QSS)
+        root = QVBoxLayout(s); root.setContentsMargins(18, 18, 18, 14); root.setSpacing(12)
+        body = QHBoxLayout(); body.setSpacing(18); root.addLayout(body, 1)
+        side = QFrame(); side.setObjectName("side"); side.setFixedWidth(210); sv = QVBoxLayout(side); sv.setContentsMargins(12, 18, 12, 12); sv.setSpacing(4)
+        brand = QLabel("AI Overlay"); brand.setObjectName("brand"); ver = QLabel(f"Settings  ·  v{APP_VERSION}"); ver.setObjectName("ver")
+        sv.addWidget(brand); sv.addWidget(ver); sv.addSpacing(12)
+        s.nav = QListWidget(); s.nav.setObjectName("nav"); s.nav.setFocusPolicy(Qt.FocusPolicy.NoFocus)
+        for name in s.PAGES: s.nav.addItem(f"{s.ICONS[name]}   {name}")
+        sv.addWidget(s.nav, 1); body.addWidget(side)
         s.stack = QStackedWidget(); body.addWidget(s.stack, 1)
         for build in (s._general, s._providers, s._apikeys, s._voice, s._display, s._memory, s._data): s.stack.addWidget(build())
         s.nav.currentRowChanged.connect(s.stack.setCurrentIndex); s.nav.setCurrentRow(0)
 
-        bar = QHBoxLayout(); s.status = QLabel(""); s.status.setObjectName("hint")
-        cancel = QPushButton("Cancel"); save = QPushButton("Save"); save.setObjectName("save")
+        sep = QFrame(); sep.setObjectName("sep"); sep.setFixedHeight(1); root.addWidget(sep)
+        bar = QHBoxLayout(); bar.setContentsMargins(4, 2, 4, 0); bar.setSpacing(10); s.status = QLabel(""); s.status.setObjectName("hint")
+        cancel = QPushButton("Cancel"); save = QPushButton("Save changes"); save.setObjectName("save"); cancel.setObjectName("ghost")
         cancel.clicked.connect(s.close); save.clicked.connect(s.save)
         bar.addWidget(s.status, 1); bar.addWidget(cancel); bar.addWidget(save); root.addLayout(bar)
         for b in s.findChildren(QPushButton): b.setAutoDefault(False); b.setDefault(False)    # Enter in a field must never press a random button
@@ -2320,18 +2408,19 @@ class Settings(QDialog):
         s.effort = QComboBox(); s.effort.addItems(["minimal", "low", "medium", "high"])
         s.sil = QDoubleSpinBox(); s.sil.setRange(0.4, 5); s.sil.setSingleStep(0.1); s.sil.setSuffix(" s")
         s.steps = QSpinBox(); s.steps.setRange(1, 25); s.maxtok = QSpinBox(); s.maxtok.setRange(100, 4000); s.maxtok.setSingleStep(100)
-        s.confirm = QCheckBox("Ask before every mouse / keyboard / close-app action")
+        s.confirm = Switch("Ask before every mouse / keyboard / close-app action")
         f1.addRow("Thinking effort", s.effort); f1.addRow("Auto-send after silence", s.sil); f1.addRow("Max reply tokens", s.maxtok)
         f1.addRow("Max steps (Screen control)", s.steps); f1.addRow("", s.confirm)
-        s.sp_id = QLineEdit(); s.sp_id.setPlaceholderText("Spotify Client ID (developer.spotify.com, redirect http://127.0.0.1:8888/callback)"); f1.addRow("Spotify API (Premium only)", s.sp_id)
-        s.music = QComboBox(); s.music.addItems(["spotify", "youtube"]); f1.addRow("Play music with", s.music)
+        cm, fm, _ = mk_card("Music", "Free Spotify works: the assistant clicks Play for you and checks that music is really playing. YouTube starts by itself.")
+        s.music = QComboBox(); s.music.addItems(["spotify", "youtube"]); fm.addRow("Play music with", s.music)
+        s.sp_id = QLineEdit(); s.sp_id.setPlaceholderText("Optional, Premium accounts only"); fm.addRow("Spotify Client ID", s.sp_id)
         c2, f2, v2 = mk_card("Hotkeys", "Click Change, then press the new shortcut. Use a modifier (Ctrl / Alt / Shift / Win) or an F-key.")
         s.edits, s.btns = {}, {}
         for k, label in HK_LABELS:
             row = QHBoxLayout(); e = HotkeyEdit(); b = QPushButton("Change"); b.setFixedWidth(84)
             b.clicked.connect(lambda _, k=k: s.record(k)); row.addWidget(e, 1); row.addWidget(b); s.edits[k], s.btns[k] = e, b; f2.addRow(label, row)
         rb = QPushButton("Reset to defaults"); rb.clicked.connect(s.reset_hk); v2.addWidget(rb, 0, Qt.AlignmentFlag.AlignLeft)
-        return mk_page("General", c1, c2)
+        return mk_page("General", c1, cm, c2)
 
     def _providers(s):
         c, f, v = mk_card("Model providers", "Tried top to bottom; the first that answers wins. Any OpenAI-compatible endpoint works. API keys are managed in the “API keys” tab.")
@@ -2391,7 +2480,7 @@ class Settings(QDialog):
         c2, f2, v2 = mk_card("Files", "config.json, memory.json and vault.bin live next to the program.")
         bf = QPushButton("Open data folder"); bf.clicked.connect(s.open_folder); v2.addWidget(bf, 0, Qt.AlignmentFlag.AlignLeft)
         c3, f3, v3 = mk_card("Updates", f"Version {APP_VERSION}. The app checks GitHub for a newer release and tells you.")
-        s.auto_upd = QCheckBox("Check for updates automatically"); f3.addRow("", s.auto_upd)
+        s.auto_upd = Switch("Check for updates automatically"); f3.addRow("", s.auto_upd)
         bu = QPushButton("Check now"); bu.clicked.connect(lambda: s.app.check_updates(manual=True)); v3.addWidget(bu, 0, Qt.AlignmentFlag.AlignLeft)
         return mk_page("Data", c1, c2, c3)
 
