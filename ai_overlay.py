@@ -17,7 +17,7 @@ pip install PyQt6 requests keyboard sounddevice numpy pyautogui cryptography
 Run: python ai_overlay.py   (rename to .pyw to hide the console)
 Emergency stop for any automation: Ctrl+Alt+X (rebindable) or fling the mouse into a screen corner.
 """
-import sys, os, io, re, ast, csv, copy, json, wave, time, math, queue, base64, threading, subprocess, webbrowser
+import sys, os, io, re, ast, csv, uuid, copy, json, wave, time, math, queue, base64, threading, subprocess, webbrowser
 import urllib.parse
 import requests, keyboard, numpy as np, sounddevice as sd
 if sys.platform == "win32":     # must run before pyautogui/Qt: per-monitor DPI keeps coordinates right on mixed-DPI multi-monitor setups
@@ -36,6 +36,7 @@ except Exception:
     Fernet = None
 from PyQt6.QtCore import (Qt, QRect, QRectF, QTimer, QObject, pyqtSignal, QPropertyAnimation,
                           QParallelAnimationGroup, QEasingCurve, QBuffer, QByteArray, QPointF, QEvent, QSize)
+from PyQt6.QtWidgets import QToolTip
 from PyQt6.QtGui import (QPainter, QColor, QPen, QCursor, QGuiApplication, QRadialGradient, QConicalGradient,
                          QIcon, QPixmap, QAction, QFont, QPolygonF, QPainterPath, QImage, QKeySequence)
 from PyQt6.QtWidgets import (QApplication, QWidget, QFrame, QVBoxLayout, QHBoxLayout, QLabel, QPushButton,
@@ -96,6 +97,7 @@ DEFAULTS = {
     "max_tokens": 600,               # lower = less credit reserved per request (OpenRouter) and faster replies
     "max_steps": 8,                  # max observe-act rounds per request in Screen control mode
     "auto_update": True, "skipped_version": "",
+    "connections": {},               # connected apps: {id: {"enabled": bool, ...fields}}
     "music_service": "spotify",      # spotify | youtube: used when a request does not name a service
     "spotify_client_id": "",         # Spotify Web API (hands-free playback); redirect URI http://127.0.0.1:8888/callback
 }
@@ -1499,10 +1501,206 @@ class CanvasWindow(QWidget):
 CONTROL = {"click", "move", "drag", "scroll", "type", "key", "wait"}
 
 
+# ---------- connections: apps that send notifications and accept replies ----------
+from dataclasses import dataclass, field
+
+
+@dataclass
+class Notice:
+    id: str; app_id: str; app: str; icon: str; title: str; body: str; ts: float
+    can_reply: bool = False; meta: dict = field(default_factory=dict)
+
+
+class Connector:
+    """Base class. To add an app: subclass, set id/name/icon/FIELDS, implement run() (loop until self.stop is set,
+    call self.push(...) for each event) and reply(); then add it to CONNECTORS. Settings and the drawer pick it up automatically."""
+    id = ""; name = ""; icon = "🔗"; blurb = ""; FIELDS = []          # FIELDS: [(key, label, is_secret)]
+
+    def __init__(s, hub, conf): s.hub, s.conf, s.stop = hub, conf, threading.Event()
+
+    def start(s): threading.Thread(target=s._guard, daemon=True).start()
+
+    def _guard(s):
+        try: s.run()
+        except Exception as ex: s.hub.set_status(s.id, f"error: {str(ex)[:120]}")
+
+    def halt(s): s.stop.set()
+
+    def push(s, title, body, app=None, can_reply=False, meta=None):
+        s.hub.notice.emit(Notice(uuid.uuid4().hex[:8], s.id, app or s.name, s.icon, str(title), str(body), time.time(), can_reply, meta or {}))
+
+    def run(s): raise NotImplementedError
+    def reply(s, n, text): raise NotImplementedError
+
+
+class TelegramConnector(Connector):
+    id, name, icon = "telegram", "Telegram", "✈️"
+    blurb = "Messages sent to your bot appear here and you can answer from the overlay. Create a bot with @BotFather and paste its token."
+    FIELDS = [("token", "Bot token", True)]
+
+    def run(s):
+        tok = s.conf.get("token", "").strip()
+        if not tok: raise RuntimeError("enter the bot token")
+        s.base = f"https://api.telegram.org/bot{tok}"; off = 0
+        me = SESSION.get(s.base + "/getMe", timeout=10).json()
+        if not me.get("ok"): raise RuntimeError("invalid bot token")
+        s.hub.set_status(s.id, "connected as @" + me["result"].get("username", "bot"))
+        while not s.stop.is_set():
+            r = SESSION.get(s.base + "/getUpdates", params={"timeout": 25, "offset": off}, timeout=35).json()
+            if not r.get("ok"): time.sleep(3); continue
+            for u in r.get("result", []):
+                off = u["update_id"] + 1; m = u.get("message") or {}
+                if m.get("text"): s.push(m.get("from", {}).get("first_name", "Someone"), m["text"], can_reply=True, meta={"chat": m["chat"]["id"]})
+
+    def reply(s, n, text):
+        SESSION.post(s.base + "/sendMessage", json={"chat_id": n.meta["chat"], "text": text}, timeout=10).raise_for_status()
+
+
+class WebhookConnector(Connector):
+    id, name, icon = "webhook", "Webhook (any app)", "🔌"
+    blurb = ('Any app, script or automation (Zapier, n8n, IFTTT, your own bot) can POST JSON to http://127.0.0.1:PORT/ with '
+             '{"app","title","body","reply_url"}. Add a reply_url so your replies go back to it. Local only.')
+    FIELDS = [("port", "Port (default 8765)", False), ("secret", "Secret (optional, sent as X-Secret)", True)]
+
+    def run(s):
+        import http.server
+        port = int(s.conf.get("port") or 8765); secret = s.conf.get("secret", ""); me = s
+
+        class H(http.server.BaseHTTPRequestHandler):
+            def do_POST(h):
+                try:
+                    if "json" not in h.headers.get("Content-Type", ""): h.send_response(415); h.end_headers(); return     # blocks cross-site form posts
+                    if secret and h.headers.get("X-Secret", "") != secret: h.send_response(403); h.end_headers(); return
+                    j = json.loads(h.rfile.read(min(int(h.headers.get("Content-Length", 0)), 20000)) or b"{}"); ru = str(j.get("reply_url") or "")
+                    me.push(str(j.get("title") or "Notification")[:120], str(j.get("body") or "")[:1000], app=str(j.get("app") or "")[:40] or None,
+                            can_reply=ru.startswith(("http://", "https://")), meta={"reply_url": ru, "ref": j.get("id")})
+                    h.send_response(200); h.end_headers(); h.wfile.write(b"ok")
+                except Exception: h.send_response(400); h.end_headers()
+            def log_message(h, *a): pass
+        srv = http.server.HTTPServer(("127.0.0.1", port), H); srv.timeout = 0.5
+        s.hub.set_status(s.id, f"listening on 127.0.0.1:{port}")
+        try:
+            while not s.stop.is_set(): srv.handle_request()
+        finally: srv.server_close()
+
+    def reply(s, n, text): SESSION.post(n.meta["reply_url"], json={"reply": text, "id": n.meta.get("ref")}, timeout=10).raise_for_status()
+
+
+class SpotifyConnector(Connector):
+    id, name, icon = "spotify", "Spotify", "🎵"
+    blurb = "Shows what is playing. Reply with a song name to play it. Needs a Spotify Client ID (the account that creates the app needs Premium)."
+    FIELDS = [("client_id", "Client ID", False)]
+
+    def _api(s): cfg = dict(s.hub.cfg); cfg["spotify_client_id"] = s.conf.get("client_id", ""); return SpotifyAPI(cfg)
+
+    def run(s):
+        api = s._api()
+        if not api.enabled(): raise RuntimeError("enter your Spotify Client ID")
+        s.hub.set_status(s.id, "waiting for login in your browser…"); api.access(); s.hub.set_status(s.id, "connected"); last = None
+        while not s.stop.is_set():
+            r = api.call("GET", "/me/player/currently-playing")
+            it = r.json().get("item") if r.status_code == 200 and r.text else None
+            if it and it.get("id") != last:
+                last = it["id"]; s.push("Now playing", f"{it['name']} - {it['artists'][0]['name']}", can_reply=True)
+            s.stop.wait(6)
+
+    def reply(s, n, text): s._api().play(re.sub(r"^play\s+", "", text, flags=re.I), "track", s.stop)
+
+
+CONNECTORS = {c.id: c for c in (SpotifyConnector, TelegramConnector, WebhookConnector)}
+
+
+class ConnectorHub(QObject):
+    notice = pyqtSignal(object); status = pyqtSignal(str, str); replied = pyqtSignal(str, bool, str)
+
+    def __init__(s, cfg): super().__init__(); s.cfg = cfg; s.live = {}; s.state = {}
+
+    def set_status(s, cid, text): s.state[cid] = text; s.status.emit(cid, text)
+
+    def apply(s):
+        """Start/stop connectors to match the saved settings."""
+        conns = s.cfg.get("connections", {})
+        for cid, cls in CONNECTORS.items():
+            c = conns.get(cid, {}); want = bool(c.get("enabled")); live = s.live.get(cid)
+            if live and (not want or live.conf != c): live.halt(); s.live.pop(cid); s.set_status(cid, "off")
+            if want and cid not in s.live:
+                s.live[cid] = cls(s, dict(c)); s.set_status(cid, "connecting…"); s.live[cid].start()
+
+    def reply(s, n, text):
+        def work():
+            try:
+                c = s.live.get(n.app_id)
+                if not c: raise RuntimeError("that app is disconnected")
+                c.reply(n, text); s.replied.emit(n.id, True, "")
+            except Exception as ex: s.replied.emit(n.id, False, str(ex))
+        threading.Thread(target=work, daemon=True).start()
+
+
+class NoticeCard(QFrame):
+    reply = pyqtSignal(object, str); dismiss = pyqtSignal(object)
+
+    def __init__(s, n):
+        super().__init__(); s.n = n; s.sent = ""; s.setObjectName("ncard")
+        v = QVBoxLayout(s); v.setContentsMargins(12, 10, 12, 10); v.setSpacing(6)
+        h = QHBoxLayout(); a = QLabel(f"{n.icon}  {n.app}"); a.setObjectName("napp")
+        t = QLabel(time.strftime("%H:%M", time.localtime(n.ts))); t.setObjectName("ntime")
+        x = QPushButton("✕"); x.setObjectName("nx"); x.setFixedSize(22, 22); x.clicked.connect(lambda: s.dismiss.emit(s.n))
+        h.addWidget(a, 1); h.addWidget(t); h.addWidget(x); v.addLayout(h)
+        if n.title: tl = QLabel(n.title); tl.setObjectName("ntitle"); tl.setWordWrap(True); v.addWidget(tl)
+        if n.body:
+            b = QLabel(n.body[:600]); b.setObjectName("nbody"); b.setWordWrap(True)
+            b.setTextInteractionFlags(Qt.TextInteractionFlag.TextSelectableByMouse); v.addWidget(b)
+        s.res = QLabel(""); s.res.setObjectName("nres"); s.res.setWordWrap(True); s.res.hide(); v.addWidget(s.res)
+        if n.can_reply:
+            r = QHBoxLayout(); s.ed = QLineEdit(); s.ed.setObjectName("nreply"); s.ed.setPlaceholderText("Reply…")
+            s.go = QPushButton("↑"); s.go.setObjectName("nsend"); s.go.setFixedSize(28, 28)
+            s.ed.returnPressed.connect(s.send); s.go.clicked.connect(s.send); r.addWidget(s.ed, 1); r.addWidget(s.go); v.addLayout(r)
+
+    def send(s):
+        t = s.ed.text().strip()
+        if not t: return
+        s.sent = t; s.ed.setEnabled(False); s.go.setEnabled(False)
+        s.res.setStyleSheet(""); s.res.setText("Sending…"); s.res.show(); s.reply.emit(s.n, t)
+
+    def set_result(s, ok, err=""):
+        s.res.setStyleSheet("" if ok else "color:#ff9aa8")
+        s.res.setText(("✓ Sent: " + s.sent[:60]) if ok else ("⚠ " + err[:100])); s.res.show(); s.ed.setEnabled(True); s.go.setEnabled(True)
+        if ok: s.ed.clear()
+
+
+OVERLAY_QSS = """
+    #panel{background:qlineargradient(x1:0,y1:0,x2:0,y2:1,stop:0 #1f222b,stop:1 #16181e);border:1px solid #2c313d;border-radius:24px}
+    QLabel{color:#9aa3b8;font:13px 'Segoe UI'}
+    QPushButton{background:#272b36;color:#e8ebf4;border:none;border-radius:14px;padding:6px 13px;font:12px 'Segoe UI'}
+    QPushButton:hover{background:#31364a} QPushButton:pressed{background:#222633}
+    QPushButton:checked{background:qlineargradient(x1:0,y1:0,x2:1,y2:0,stop:0 #4f6df5,stop:1 #7a5cf0);color:#fff}
+    QLineEdit{background:#12141a;color:#eef1fa;border:1px solid #272b38;border-radius:17px;padding:9px 16px;font:14px 'Segoe UI';selection-background-color:#4f6df5}
+    QLineEdit:focus{border:1px solid #4f6df5}
+    QTextBrowser{background:transparent;color:#e8ebf4;border:none;font:14px 'Segoe UI'}
+    QLabel#src{color:#8ab4f8;font:11px 'Segoe UI'}
+    QFrame#chip{background:#1b1e27;border:1px solid #2c313d;border-radius:14px}
+    QLabel#thumb{background:#0f1116;border-radius:8px} QLabel#chiptitle{color:#c9d1ff;font:600 12px 'Segoe UI'}
+    QPushButton#quick{background:#232842;color:#bcc6ff;border-radius:11px;padding:4px 11px;font:11px 'Segoe UI'} QPushButton#quick:hover{background:#2e3560}
+    QPushButton#chipx,QPushButton#nx{background:transparent;color:#7d869c;padding:0;border-radius:11px} QPushButton#chipx:hover,QPushButton#nx:hover{background:#2b3040;color:#fff}
+    QFrame#drawer{background:#13151b;border-left:1px solid #262a36;border-top-right-radius:24px;border-bottom-right-radius:24px}
+    QLabel#dtitle{color:#fff;font:600 14px 'Segoe UI'} QLabel#dempty{color:#6f778c;font:12px 'Segoe UI'}
+    QPushButton#link{background:transparent;color:#8ab4f8;padding:2px 6px;font:11px 'Segoe UI'} QPushButton#link:hover{color:#fff}
+    QFrame#ncard{background:#1b1e27;border:1px solid #2a2f3c;border-radius:14px}
+    QLabel#napp{color:#8ab4f8;font:600 11px 'Segoe UI'} QLabel#ntime{color:#6f778c;font:11px 'Segoe UI'}
+    QLabel#ntitle{color:#fff;font:600 13px 'Segoe UI'} QLabel#nbody{color:#c3c9d9;font:12px 'Segoe UI'} QLabel#nres{color:#7be3c0;font:11px 'Segoe UI'}
+    QLineEdit#nreply{border-radius:13px;padding:5px 11px;font:12px 'Segoe UI'}
+    QPushButton#nsend{background:#4f6df5;color:#fff;border-radius:14px;padding:0;font:600 14px 'Segoe UI'} QPushButton#nsend:hover{background:#6a84ff}
+    QScrollArea,QScrollArea>QWidget>QWidget{background:transparent;border:none}
+    QScrollBar:vertical{background:transparent;width:8px} QScrollBar::handle:vertical{background:#303546;border-radius:4px;min-height:24px}
+    QScrollBar::add-line,QScrollBar::sub-line{height:0}
+    QToolTip{background:#1b1e27;color:#e8ebf4;border:1px solid #2a2e3b;padding:5px}"""
+
+
 class Overlay(QWidget):
     partial = pyqtSignal(int, str); finished = pyqtSignal(int, bool); heard = pyqtSignal(int, str)
     acts_done = pyqtSignal(int, object); note = pyqtSignal(str); open_settings = pyqtSignal(); served = pyqtSignal(int, str); launched = pyqtSignal(int, object, object); fast = pyqtSignal(int, object, str)
-    W, H_COMPACT, H_FULL = 820, 150, 540
+    W_BASE, DRAWER_W, H_COMPACT, H_FULL = 820, 300, 150, 540
+    W = property(lambda s: s.W_BASE + (s.DRAWER_W if getattr(s, "_drawer_on", False) else 0))   # grows when the notification drawer is open
 
     def __init__(s, cfg, memory, vault):
         super().__init__()
@@ -1518,46 +1716,58 @@ class Overlay(QWidget):
 
         outer = QVBoxLayout(s); outer.setContentsMargins(16, 16, 16, 16)
         panel = QFrame(); panel.setObjectName("panel"); outer.addWidget(panel)
-        sh = QGraphicsDropShadowEffect(); sh.setBlurRadius(32); sh.setOffset(0, 4); sh.setColor(QColor(0, 0, 0, 160))
-        panel.setGraphicsEffect(sh)
-        lay = QVBoxLayout(panel); lay.setContentsMargins(16, 12, 16, 14)
+        s._panel = panel; s.notices = []; s._drawer_on = False; s._unread = 0; s.hub = None; s._tickn = 0     # shadow is painted in paintEvent (graphics effects were slow and left artifacts)
+        hbox = QHBoxLayout(panel); hbox.setContentsMargins(0, 0, 0, 0); hbox.setSpacing(0)
+        mainw = QWidget(); lay = QVBoxLayout(mainw); lay.setContentsMargins(16, 12, 16, 14); hbox.addWidget(mainw, 1)
+        s.drawer = QFrame(); s.drawer.setObjectName("drawer"); s.drawer.setFixedWidth(s.DRAWER_W); s.drawer.hide(); hbox.addWidget(s.drawer)
+        dv = QVBoxLayout(s.drawer); dv.setContentsMargins(14, 14, 14, 12); dv.setSpacing(8)
+        dh = QHBoxLayout(); dt = QLabel("Notifications"); dt.setObjectName("dtitle"); dclear = QPushButton("Clear all"); dclear.setObjectName("link")
+        dh.addWidget(dt, 1); dh.addWidget(dclear); dv.addLayout(dh)
+        s.dscroll = QScrollArea(); s.dscroll.setWidgetResizable(True); s.dscroll.setFrameShape(QFrame.Shape.NoFrame)
+        dinner = QWidget(); s.dlist = QVBoxLayout(dinner); s.dlist.setContentsMargins(0, 0, 4, 0); s.dlist.setSpacing(8)
+        s.dempty = QLabel("Nothing yet.\nConnect apps in Settings → Connections."); s.dempty.setObjectName("dempty"); s.dempty.setAlignment(Qt.AlignmentFlag.AlignCenter)
+        s.dlist.addWidget(s.dempty); s.dlist.addStretch(1); s.dscroll.setWidget(dinner); dv.addWidget(s.dscroll, 1)
+        dclear.clicked.connect(s.clear_notices)
 
         top = QHBoxLayout(); s.orb = Orb(); top.addWidget(s.orb)
         s.status = QLabel("Listening…"); top.addWidget(s.status, 1)
         s.b_sum = QPushButton("Summarize"); s.b_area = QPushButton("Select area")
         s.b_scr = QPushButton("Screen control"); s.b_scr.setCheckable(True)
-        s.b_can = QPushButton("Canvas"); s.b_snd = QPushButton("🔊"); s.b_snd.setCheckable(True); s.b_snd.setChecked(not cfg.get("muted"))
+        s.b_can = QPushButton("Canvas"); s.b_bell = QPushButton("🔔"); s.b_snd = QPushButton("🔊"); s.b_snd.setCheckable(True); s.b_snd.setChecked(not cfg.get("muted"))
         s.b_set = QPushButton("⚙"); s.b_x = QPushButton("✕")
         for b in (s.b_snd, s.b_set, s.b_x): b.setFixedWidth(32)
         s.b_sum.setToolTip("One-shot, read-only summary of your screen (or the selected area)")
         s.b_area.setToolTip("Pick a region for the assistant to look at (read-only)")
         s.b_scr.setToolTip("Live mode: fresh screenshot every turn; the assistant can click, drag, scroll and type.\nStop anytime with the emergency-stop hotkey.")
         s.b_snd.setToolTip("Spoken replies on/off")
-        for b in (s.b_sum, s.b_area, s.b_scr, s.b_can, s.b_snd, s.b_set, s.b_x):
+        for b in (s.b_sum, s.b_area, s.b_scr, s.b_can, s.b_bell, s.b_snd, s.b_set, s.b_x):
             b.setCursor(Qt.CursorShape.PointingHandCursor); top.addWidget(b)
         lay.addLayout(top)
         s.out = QTextBrowser(); s.out.setOpenExternalLinks(True); s.out.hide(); lay.addWidget(s.out, 1)
         s.srcl = QLabel(""); s.srcl.setObjectName("src"); s.srcl.setWordWrap(True); s.srcl.hide(); lay.addWidget(s.srcl)
+        s.chip = QFrame(); s.chip.setObjectName("chip"); s.chip.hide(); cv = QHBoxLayout(s.chip); cv.setContentsMargins(8, 6, 8, 6); cv.setSpacing(10)
+        s.thumb = QLabel(); s.thumb.setFixedSize(84, 52); s.thumb.setObjectName("thumb"); cv.addWidget(s.thumb)
+        ct = QVBoxLayout(); ct.setSpacing(4); cl = QLabel("Asking about the selected area"); cl.setObjectName("chiptitle"); ct.addWidget(cl)
+        qrow = QHBoxLayout(); qrow.setSpacing(6)
+        for label, prompt in (("Explain", "Explain what is in this area."), ("Summarize", "Summarize this area briefly."),
+                              ("Translate", "Translate the text in this area (to English, or to Hebrew if it is already English)."), ("Extract text", "Extract all the text in this area exactly.")):
+            qb = QPushButton(label); qb.setObjectName("quick"); qb.setCursor(Qt.CursorShape.PointingHandCursor); qb.clicked.connect(lambda _, p=prompt: s.user_ask(text=p)); qrow.addWidget(qb)
+        qrow.addStretch(1); ct.addLayout(qrow); cv.addLayout(ct, 1)
+        cx = QPushButton("✕"); cx.setObjectName("chipx"); cx.setFixedSize(26, 26); cx.setToolTip("Remove the area"); cx.clicked.connect(lambda: s.set_region(None)); cv.addWidget(cx, 0, Qt.AlignmentFlag.AlignTop)
+        lay.addWidget(s.chip)
         bot = QHBoxLayout(); s.edit = QLineEdit(); s.edit.setPlaceholderText("Ask anything, or just speak…")
         s.b_mic = QPushButton("🎤"); s.b_mic.setFixedWidth(40); bot.addWidget(s.edit, 1); bot.addWidget(s.b_mic); lay.addLayout(bot)
-        s.setStyleSheet("""
-            #panel{background:#202124;border:1px solid #3c4043;border-radius:26px}
-            QLabel{color:#9aa0a6;font:13px 'Segoe UI'}
-            QPushButton{background:#303134;color:#e8eaed;border:none;border-radius:14px;padding:6px 12px;font:12px 'Segoe UI'}
-            QPushButton:hover{background:#3c4043} QPushButton:checked{background:#3b5bdb}
-            QLineEdit{background:#303134;color:#e8eaed;border:none;border-radius:16px;padding:8px 14px;font:14px 'Segoe UI'}
-            QTextBrowser{background:transparent;color:#e8eaed;border:none;font:14px 'Segoe UI'}
-            QLabel#src{color:#8ab4f8;font:11px 'Segoe UI'}""")
+        s.setStyleSheet(OVERLAY_QSS)
 
         s.b_x.clicked.connect(s.close_overlay)
         s.b_set.clicked.connect(s.request_settings)
         s.b_sum.clicked.connect(s.summarize); s.b_area.clicked.connect(s.select_area)
-        s.b_scr.toggled.connect(s.on_screen_toggle); s.b_can.clicked.connect(s.show_canvas)
+        s.b_scr.toggled.connect(s.on_screen_toggle); s.b_can.clicked.connect(s.show_canvas); s.b_bell.clicked.connect(lambda: s.toggle_drawer())
         s.b_snd.toggled.connect(s.on_sound_toggle); s.b_mic.clicked.connect(s.mic_clicked)
         s.edit.returnPressed.connect(s.submit_text)
         s.partial.connect(s.on_partial); s.finished.connect(s.on_finished); s.heard.connect(s.on_heard)
         s.acts_done.connect(s.on_acts_done); s.note.connect(s.on_note); s.served.connect(s.on_served); s.launched.connect(s.on_launched); s.fast.connect(s.on_fast)
-        s.timer = QTimer(s); s.timer.timeout.connect(s.tick); s.timer.start(33)
+        s.timer = QTimer(s); s.timer.timeout.connect(s.tick)        # started on open, stopped on close
 
     # --- geometry / animation ---
     def screen_now(s):
@@ -1597,7 +1807,8 @@ class Overlay(QWidget):
         s.scr = resolve_screen(s.cfg)                  # locked for this session so automation moving the mouse can't switch monitors
         s.speaker.stop()
         s.b_scr.blockSignals(True); s.b_scr.setChecked(False); s.b_scr.blockSignals(False)
-        s.b_area.setText("Select area"); s.out.hide(); s.out.clear(); s.srcl.hide(); s.edit.clear()
+        s.set_region(None); s.out.hide(); s.out.clear(); s.srcl.hide(); s.edit.clear()
+        if not s.timer.isActive(): s.timer.start(33)
         warm([p["url"] for p in s.cfg["providers"]] + ([s.cfg["tts_url"]] if s.cfg["tts_provider"] == "openai" else
                                                        ["https://api.elevenlabs.io"] if s.speaker.enabled() else []))
         end = s.target(s.H_COMPACT); start = QRect(end); start.translate(0, 70)
@@ -1607,13 +1818,13 @@ class Overlay(QWidget):
         else: s.set_state("idle", "Ready")
 
     def close_overlay(s):
-        s.req += 1; s.speaker.stop(); s.stop_ev.set()
+        QToolTip.hideText(); s.req += 1; s.speaker.stop(); s.stop_ev.set()
         if s.rec.stream: s.rec.stop()
         s._stealth = False; s.state = "idle"; s.orb.mode = "idle"; s._closing = True
         end = QRect(s.geometry()); end.translate(0, 70); s.run(end, 0.0, s._finish_close, 220)
 
     def _finish_close(s):
-        if s._closing: s.hide()
+        if s._closing: s.hide(); s.timer.stop(); QToolTip.hideText()
 
     def keyPressEvent(s, e):
         if e.key() == Qt.Key.Key_Escape: s.close_overlay()
@@ -1672,7 +1883,8 @@ class Overlay(QWidget):
 
     def tick(s):
         if not s.isVisible(): return
-        s.orb.level = s.rec.level; s.orb.update()
+        s.orb.level = s.rec.level; s._tickn += 1
+        if s.state != "idle" or s.rec.level > 0.02 or s._tickn % 3 == 0: s.orb.update()      # idle orb repaints at 1/3 rate
         if s.state == "listening":
             r = s.rec; now = time.time()
             if (r.spoke and now - r.last_voice > s.cfg["silence"]) or (not r.spoke and now - r.t0 > 8): s.finish_listening()
@@ -1680,7 +1892,7 @@ class Overlay(QWidget):
     # --- screen: summarize (read-only) vs. Screen control (live + actions) ---
     def on_screen_toggle(s, on):
         if on:
-            s.region = None; s.b_area.setText("Select area")
+            s.set_region(None)
             s.set_state("idle", "Screen control ON - I can see and control your screen" + ("" if pyautogui else " (install pyautogui!)"))
 
     def snap_screen(s, cb):
@@ -1711,14 +1923,60 @@ class Overlay(QWidget):
         s.sel.show(); s.sel.raise_(); s.sel.activateWindow(); force_foreground(s.sel); s.sel.setFocus()
 
     def region_done(s, pix):
+        s.sel = None
         if not s.isVisible():
             if pix is None: return
             s.open_overlay(listen=False)
         else: s.setWindowOpacity(1); s.activateWindow()
-        if pix is not None:
-            s.region = pix; s.b_scr.blockSignals(True); s.b_scr.setChecked(False); s.b_scr.blockSignals(False)
-            s.b_area.setText("Area ✓")
-        s.start_listening()
+        if pix is None: s.start_listening(); return
+        s.b_scr.blockSignals(True); s.b_scr.setChecked(False); s.b_scr.blockSignals(False)
+        s.set_region(pix); force_foreground(s); s.edit.setFocus()                    # ready to type right away (no auto-listening)
+        s.set_state("idle", "Area selected. Type your question, or tap a quick action.")
+
+    def set_region(s, pix):
+        s.region = pix
+        if pix is None:
+            s.b_area.setText("Select area"); s.chip.hide(); s.edit.setPlaceholderText("Ask anything, or just speak…")
+            if s.isVisible() and not s._closing and s.out.isHidden(): s.run(s.target(s.H_COMPACT), None, None, 180)
+            return
+        s.b_area.setText("Area ✓"); s.chip.show(); s.edit.setPlaceholderText("Ask about the selected area…")
+        s.thumb.setPixmap(pix.scaled(84, 52, Qt.AspectRatioMode.KeepAspectRatio, Qt.TransformationMode.SmoothTransformation))
+        if s.isVisible() and not s._closing: s.run(s.target(max(s.height(), s.H_COMPACT + 92)), None, None, 200)
+
+    # --- notification drawer ---
+    def toggle_drawer(s, show=None):
+        on = (not s._drawer_on) if show is None else bool(show)
+        if on == s._drawer_on: return
+        s._drawer_on = on; s.drawer.setVisible(on)
+        if on: s._unread = 0; s._bell(); s.dempty.setVisible(not s.notices)
+        if s.isVisible() and not s._closing: s.run(s.target(max(s.height(), 400) if on else s.height()), None, None, 220)
+
+    def _bell(s): s.b_bell.setText(f"🔔 {s._unread}" if s._unread else "🔔")
+
+    def add_notice(s, n):
+        s.notices.insert(0, n)
+        for old in s.notices[60:]: s.drop_notice(old)
+        card = NoticeCard(n); card.reply.connect(lambda nn, t: s.hub.reply(nn, t) if s.hub else None); card.dismiss.connect(s.drop_notice)
+        n._card = card; s.dlist.insertWidget(0, card); s.dempty.hide()
+        if not s._drawer_on: s._unread += 1; s._bell()
+
+    def drop_notice(s, n):
+        if n in s.notices: s.notices.remove(n)
+        c = getattr(n, "_card", None)
+        if c is not None: c.setParent(None); c.deleteLater(); n._card = None
+        s.dempty.setVisible(not s.notices)
+
+    def clear_notices(s):
+        for n in list(s.notices): s.drop_notice(n)
+
+    def on_replied(s, nid, ok, err):
+        for n in s.notices:
+            if n.id == nid and getattr(n, "_card", None) is not None: n._card.set_result(ok, err)
+
+    def paintEvent(s, e):                         # soft shadow around the panel (cheap, no graphics effect)
+        p = QPainter(s); p.setRenderHint(QPainter.RenderHint.Antialiasing); p.setPen(Qt.PenStyle.NoPen); r = QRectF(s._panel.geometry())
+        for i in range(10):
+            p.setBrush(QColor(0, 0, 0, int(34 * (1 - i / 10) ** 2))); p.drawRoundedRect(r.adjusted(-i, -i + 4, i, i + 4), 24 + i, 24 + i)
 
     # --- asking ---
     def submit_text(s):
@@ -2277,7 +2535,7 @@ SETTINGS_QSS = """
 
 PAGE_SUB = {"General": "Behavior, music and hotkeys", "Providers": "The AI models the assistant can use", "API keys": "Keys for voice and online services",
             "Voice": "How the assistant listens and speaks", "Display": "Where the overlay appears", "Memory": "What the assistant remembers about you",
-            "Data": "Your files, vault and updates"}
+            "Data": "Your files, vault and updates", "Connections": "Link apps, see their messages here and reply from the overlay"}
 
 
 def mk_card(title, hint=None):
@@ -2376,8 +2634,8 @@ class HotkeyEdit(QLineEdit):
 
 
 class Settings(QDialog):
-    PAGES = ["General", "Providers", "API keys", "Voice", "Display", "Memory", "Data"]
-    ICONS = {"General": "⚙", "Providers": "🧠", "API keys": "🔑", "Voice": "🎙", "Display": "🖥", "Memory": "💾", "Data": "📦"}
+    PAGES = ["General", "Providers", "API keys", "Voice", "Display", "Memory", "Connections", "Data"]
+    ICONS = {"General": "⚙", "Providers": "🧠", "API keys": "🔑", "Voice": "🎙", "Display": "🖥", "Memory": "💾", "Connections": "🔗", "Data": "📦"}
 
     def __init__(s, app):
         super().__init__(); s.app = app; s.recording = None; s.provs = []; s.krows = []; s._ids = []
@@ -2391,7 +2649,7 @@ class Settings(QDialog):
         for name in s.PAGES: s.nav.addItem(f"{s.ICONS[name]}   {name}")
         sv.addWidget(s.nav, 1); body.addWidget(side)
         s.stack = QStackedWidget(); body.addWidget(s.stack, 1)
-        for build in (s._general, s._providers, s._apikeys, s._voice, s._display, s._memory, s._data): s.stack.addWidget(build())
+        for build in (s._general, s._providers, s._apikeys, s._voice, s._display, s._memory, s._connections, s._data): s.stack.addWidget(build())
         s.nav.currentRowChanged.connect(s.stack.setCurrentIndex); s.nav.setCurrentRow(0)
 
         sep = QFrame(); sep.setObjectName("sep"); sep.setFixedHeight(1); root.addWidget(sep)
@@ -2473,6 +2731,29 @@ class Settings(QDialog):
         c, f, v = mk_card("Long-term memory"); s.memory_panel = MemoryPanel(s.app.memory); v.addWidget(s.memory_panel)
         return mk_page("Memory", c)
 
+    def _connections(s):
+        s.conn = {}; cards = []
+        for cid, cls in CONNECTORS.items():
+            card, f, v = mk_card(f"{cls.icon}  {cls.name}", cls.blurb)
+            on = Switch("Connected"); f.addRow("", on); fields = {}
+            for key, label, secret in cls.FIELDS:
+                e = QLineEdit(); e.setEchoMode(QLineEdit.EchoMode.Password if secret else QLineEdit.EchoMode.Normal); f.addRow(label, e); fields[key] = e
+            st = QLabel("off"); st.setObjectName("hint"); f.addRow("Status", st); s.conn[cid] = (on, fields, st); cards.append(card)
+        return mk_page("Connections", *cards)
+
+    def load_conns(s):
+        saved = s.app.cfg.get("connections", {})
+        for cid, (on, fields, st) in s.conn.items():
+            c = saved.get(cid, {}); on.setChecked(bool(c.get("enabled")))
+            for k, e in fields.items(): e.setText(str(c.get(k, "")))
+            st.setText(s.app.hub.state.get(cid, "off"))
+
+    def conns_collect(s):
+        return {cid: {"enabled": on.isChecked(), **{k: e.text().strip() for k, e in fields.items()}} for cid, (on, fields, st) in s.conn.items()}
+
+    def on_conn_status(s, cid, text):
+        if cid in s.conn: s.conn[cid][2].setText(text)
+
     def _data(s):
         c1, f1, v1 = mk_card("Secure vault", "Encrypted with your master password. The assistant can only ask for an entry; the password prompt and the reveal "
                                               "happen locally and are never sent to any AI.")
@@ -2497,7 +2778,7 @@ class Settings(QDialog):
         s.provs = copy.deepcopy(c["providers"]); s.p_refresh()
         s.tts.setCurrentText(c["tts_provider"]); s.tkey.setText(c["tts_key"]); s.tvoice.setText(c["tts_voice"]); s.tmodel.setText(c["tts_model"]); s.turl.setText(c["tts_url"])
         s.stt.setCurrentText(c["stt_mode"]); s.surl.setText(c["stt_url"]); s.skey.setText(c["stt_key"]); s.smodel.setText(c["stt_model"])
-        s.refresh_displays(c.get("display", "cursor")); s.memory_panel.refresh(); s.status.setText("")
+        s.refresh_displays(c.get("display", "cursor")); s.memory_panel.refresh(); s.load_conns(); s.status.setText("")
 
     def showEvent(s, e):
         if not e.spontaneous(): s.load()          # only on a real open - never wipe unsaved edits when restored from minimize
@@ -2607,9 +2888,10 @@ class Settings(QDialog):
                          tts_key=s.tkey.text(), tts_voice=s.tvoice.text().strip(), tts_model=s.tmodel.text().strip(),
                          tts_url=s.turl.text().strip(), stt_mode=s.stt.currentText(), stt_url=s.surl.text().strip(),
                          stt_key=s.skey.text(), stt_model=s.smodel.text().strip(), display=s.disp.currentData() or "cursor", **combos)
+        s.app.cfg["connections"] = s.conns_collect()
         try: save_cfg(s.app.cfg)
         except Exception as ex: QMessageBox.warning(s, "Settings", f"Couldn't write config.json: {ex}"); return
-        s.app.apply_hotkeys(); s.app.ov.apply_display(); s.close()
+        s.app.apply_hotkeys(); s.app.ov.apply_display(); s.app.hub.apply(); s.close()
 
 
 # ---------- update check (GitHub Releases) ----------
@@ -2658,7 +2940,19 @@ class App(QObject):
         s.apply_hotkeys()
         s.update_found.connect(s.on_update_found)
         QTimer.singleShot(5000, s.check_updates); s._ut = QTimer(s); s._ut.timeout.connect(s.check_updates); s._ut.start(6 * 3600 * 1000)
+        s.hub = ConnectorHub(s.cfg); s.ov.hub = s.hub
+        s.hub.notice.connect(s.on_notice); s.hub.replied.connect(s.ov.on_replied); s.hub.status.connect(s.settings.on_conn_status)
+        s.tray.messageClicked.connect(s.open_notifications); QTimer.singleShot(1500, s.hub.apply)
         if not s.ov.providers(): s.show_settings()
+
+    # ---------- connected apps ----------
+    def on_notice(s, n):
+        s.ov.add_notice(n)
+        if not s.ov.is_open(): s.tray.showMessage(f"{n.app}: {n.title}"[:60], n.body[:120], QSystemTrayIcon.MessageIcon.Information, 5000)
+
+    def open_notifications(s):
+        if not s.ov.is_open(): s.ov.open_overlay(listen=False)
+        s.ov.toggle_drawer(True)
 
     # ---------- updates ----------
     def check_updates(s, manual=False):
