@@ -12,6 +12,10 @@ What's new
     and a local master-password prompt is shown. The reveal happens locally and is never sent to any AI.
   * Canvas: shapes (triangles, circles, polygons...) and function plots (sin(x), x**2 ...), pan/zoom/pen/save.
   * "Open / close Spotify, Chrome, Google, YouTube, Notepad ..." by voice or text.
+  * Collapsible AI orb: the overlay opens as a breathing, glowing orb docked where you like (Settings > Display, or drag it);
+    hovering reveals the controls and moving away collapses it again.
+  * Explain / Summarize / Translate draw a teacher-on-a-whiteboard walkthrough: step cards, an animated pointer line
+    and a highlighted frame on the exact element, with next / back / read-aloud / dismiss controls.
 
 pip install PyQt6 requests keyboard sounddevice numpy pyautogui cryptography
 Run: python ai_overlay.py   (rename to .pyw to hide the console)
@@ -39,7 +43,8 @@ from PyQt6.QtCore import (Qt, QRect, QRectF, QTimer, QObject, pyqtSignal, QPrope
                           QParallelAnimationGroup, QEasingCurve, QBuffer, QByteArray, QPointF, QEvent, QSize, QMimeData)
 from PyQt6.QtWidgets import QToolTip
 from PyQt6.QtGui import (QPainter, QColor, QPen, QCursor, QGuiApplication, QRadialGradient, QConicalGradient,
-                         QIcon, QPixmap, QAction, QFont, QPolygonF, QPainterPath, QImage, QKeySequence)
+                         QIcon, QPixmap, QAction, QFont, QPolygonF, QPainterPath, QImage, QKeySequence,
+                         QFontMetrics, QLinearGradient)
 from PyQt6.QtWidgets import (QApplication, QWidget, QFrame, QVBoxLayout, QHBoxLayout, QLabel, QPushButton,
                              QLineEdit, QTextBrowser, QGraphicsDropShadowEffect, QSystemTrayIcon, QMenu,
                              QDialog, QFormLayout, QComboBox, QDoubleSpinBox, QSpinBox, QMessageBox,
@@ -106,10 +111,38 @@ DEFAULTS = {
     "connections": {},               # connected apps: {id: {"enabled": bool, ...fields}}
     "music_service": "spotify",      # spotify | youtube: used when a request does not name a service
     "spotify_client_id": "",         # Spotify Web API (hands-free playback); redirect URI http://127.0.0.1:8888/callback
+    "orb_position": "bottom-right",  # where the collapsed AI orb sits (see ORB_PLACES); "custom" uses orb_x/orb_y
+    "orb_x": -1, "orb_y": -1,       # custom orb position in screen pixels (saved when you drag the orb)
+    "orb_hover_expand": True,        # hover the orb to reveal the full overlay controls
+    "board_speak": True,             # read the whiteboard explanation steps aloud
 }
 HK_LABELS = [("hk_toggle", "Open / close overlay"), ("hk_summarize", "Summarize screen"),
              ("hk_area", "Select area"), ("hk_stop", "EMERGENCY STOP (cancel actions)")]
 SESSION = requests.Session()
+
+# ---------- the floating AI orb (collapsed overlay) ----------
+ORB_WIN = 112                                    # window size of the collapsed orb (the orb itself is drawn inside it)
+ORB_PLACES = [("bottom-right", "Bottom right"), ("bottom-left", "Bottom left"),
+              ("top-right", "Top right"), ("top-left", "Top left"),
+              ("center-right", "Center right"), ("center-left", "Center left"),
+              ("custom", "Custom (saved coordinates / drag the orb)")]
+
+
+def orb_rect(cfg, screen, size=ORB_WIN):
+    """Where the collapsed orb lives: a saved corner / side, or custom coordinates (clamped onto a screen)."""
+    a = screen.availableGeometry(); m = 14; place = cfg.get("orb_position", "bottom-right")
+    if place == "custom":
+        x, y = int(cfg.get("orb_x", -1)), int(cfg.get("orb_y", -1))
+        if x >= 0 and y >= 0:
+            for sc in QGuiApplication.screens():              # keep custom coordinates reachable after a monitor change
+                g = sc.availableGeometry()
+                if g.intersects(QRect(x, y, size, size)): return QRect(x, y, size, size)
+            return QRect(a.x() + a.width() - size - m, a.y() + a.height() - size - m, size, size)
+        place = "bottom-right"
+    left = "left" in place; right = "right" in place; top = "top" in place
+    x = a.x() + m if left else (a.x() + a.width() - size - m if right else a.x() + (a.width() - size) // 2)
+    y = a.y() + m if top else (a.y() + (a.height() - size) // 2 if "center" in place else a.y() + a.height() - size - m)
+    return QRect(x, y, size, size)
 
 
 def load_cfg():
@@ -199,6 +232,18 @@ RULES
 
 SUMMARY_PROMPT = ("Summarize what's on this screen: one line saying what it is, then 3-5 key points. "
                   "Read-only summary: do not suggest or perform actions.")
+PROMPT_EXPLAIN = "Explain what is on this screen step by step for the whiteboard: what it is and how to use it."
+PROMPT_TRANSLATE = ("Translate the text on this screen (to English, or to Hebrew if it is already English). "
+                    "Keep the original wording next to each translation point.")
+
+BOARD_DOC = ("\n\nWHITEBOARD MODE: first say ONE short spoken sentence. Then add exactly one fenced ```board block with strict JSON "
+             "and nothing after it:\n```board\n{\"steps\":[{\"title\":\"Short label\",\"points\":[\"one short line\",\"another line\"],"
+             "\"target\":{\"x\":120,\"y\":240,\"w\":320,\"h\":90}}]}\n```\n"
+             "2-4 steps that a teacher would walk through. Each title is 2-5 plain words. Each step gets 1-3 short points (max ~90 chars, "
+             "plain text, no markdown). target is the rectangle of the exact UI element, text block or area that step talks about, in the SAME "
+             "pixel coordinates as the screenshot grid (x,y = top-left, w,h = size). Point only at what you describe. Use null only when "
+             "nothing on screen matches. The step card is drawn beside the target rect, so keep targets inside the screenshot. "
+             "Do not emit any action blocks for this request.")
 
 # ---------- action parsing / speech text helpers ----------
 KNOWN_ACTIONS = {"open_app", "close_app", "remember", "forget", "vault_get", "login", "plot", "draw", "spotify", "youtube", "ui_list", "ui_click",
@@ -249,6 +294,68 @@ CLAIM_RE = re.compile(r"\b(?:i(?:'ll| will|'m going to| am going to|'m)\s+(?:now
 
 
 def claims_action(text): return bool(CLAIM_RE.search((strip_actions(text) or "")[:160]))
+
+
+# ---------- whiteboard explanation blocks ----------
+BOARD_KINDS = ("explain", "summarize", "translate")
+BOARD_RE = re.compile(r"```[ \t]*(?:board|whiteboard|canvas|json|steps)?[ \t]*\n?(.*?)```", re.S | re.I)
+
+
+def strip_board(t):
+    """Drop the whiteboard JSON from visible/speech text (also while it is still streaming in)."""
+    t = BOARD_RE.sub("", t or "")
+    i = t.find('"steps"')
+    if i >= 0:
+        j = t.rfind("{", 0, i)
+        if j >= 0: t = t[:j]
+    return re.sub(r"```[\s\S]*\Z", "", t).rstrip()
+
+
+def _json_at(t, i):
+    depth = 0; instr = esc = False
+    for n in range(i, len(t)):
+        c = t[n]
+        if instr:
+            if esc: esc = False
+            elif c == "\\": esc = True
+            elif c == '"': instr = False
+        elif c == '"': instr = True
+        elif c == "{": depth += 1
+        elif c == "}":
+            depth -= 1
+            if depth == 0:
+                try: return json.loads(t[i:n + 1])
+                except Exception: return None
+    return None
+
+
+def parse_board(text):
+    """Pull the teacher steps out of a reply: [{title, points[], target:QRect|None}] in screenshot pixels."""
+    cands = [m.group(1) for m in BOARD_RE.finditer(text or "")]
+    cands.append(text or "")
+    for c in cands:
+        for m in re.finditer(r"\{", c):
+            j = _json_at(c, m.start())
+            if not isinstance(j, dict) or not isinstance(j.get("steps"), list): continue
+            steps = []
+            for st in j["steps"][:6]:
+                if not isinstance(st, dict): continue
+                pts = st.get("points") or st.get("bullets") or st.get("lines") or []
+                if isinstance(pts, str): pts = [pts]
+                tgt = st.get("target") or st.get("rect") or st.get("area")
+                r = None
+                if isinstance(tgt, dict):
+                    try: r = QRect(int(tgt.get("x", 0)), int(tgt.get("y", 0)), int(tgt.get("w") or tgt.get("width") or 0), int(tgt.get("h") or tgt.get("height") or 0))
+                    except Exception: r = None
+                elif isinstance(tgt, (list, tuple)) and len(tgt) >= 4:
+                    try: r = QRect(int(tgt[0]), int(tgt[1]), int(tgt[2]), int(tgt[3]))
+                    except Exception: r = None
+                if r is not None and (r.width() <= 2 or r.height() <= 2): r = None
+                pts = [str(p).strip() for p in pts if str(p).strip()][:4]
+                title = str(st.get("title") or st.get("label") or st.get("heading") or "").strip()
+                if title or pts: steps.append({"title": title, "points": pts, "target": r})
+            if steps: return steps
+    return []
 
 
 _FAIL = re.compile(r"not moved|\bfail(?:ed|ure|s)?\b|\brefused\b|\bdeclined\b|\bunknown\b|\bno window\b|\bno (?:text field|control|accessible)|couldn't|could not|\bunable\b|"
@@ -1891,6 +1998,325 @@ class Orb(QWidget):
         p.setPen(Qt.PenStyle.NoPen); p.setBrush(g); p.drawEllipse(c, r, r)
 
 
+class AIOrb(QWidget):
+    """The collapsed overlay: a big, always-on-top AI orb with a breathing glow, orbiting ring and an AI mark.
+    Hovering it makes the overlay expand; dragging it docks the orb in a new place."""
+    clicked = pyqtSignal(); move_by = pyqtSignal(int, int); released = pyqtSignal()
+
+    def __init__(s, size=96):
+        super().__init__()
+        s.setFixedSize(size, size); s.setCursor(Qt.CursorShape.PointingHandCursor)
+        s.setToolTip("AI Overlay - hover to open  ·  drag to move")
+        s.mode = "idle"; s.level = 0.0; s.clock = 0.0; s.hover = False; s._drag = None; s._moved = False
+        s.anim = QTimer(s); s.anim.timeout.connect(s._tick); s.anim.start(33)
+
+    def _tick(s): s.clock += 0.045; s.update()
+
+    def enterEvent(s, e): s.hover = True; s.update()
+    def leaveEvent(s, e): s.hover = False; s.update()
+
+    def mousePressEvent(s, e):
+        if e.button() == Qt.MouseButton.LeftButton: s._drag = e.globalPosition().toPoint(); s._moved = False
+
+    def mouseMoveEvent(s, e):
+        if s._drag is None: return
+        p = e.globalPosition().toPoint(); d = p - s._drag
+        if not s._moved and d.manhattanLength() < 4: return
+        s._moved = True; s.move_by.emit(d.x(), d.y()); s._drag = p
+
+    def mouseReleaseEvent(s, e):
+        if s._drag is None: return
+        s._drag = None
+        if s._moved: s.released.emit()
+        else: s.clicked.emit()
+
+    def paintEvent(s, e):
+        p = QPainter(s); p.setRenderHint(QPainter.RenderHint.Antialiasing)
+        w = s.width(); c = QPointF(w / 2, w / 2); base = w * 0.32
+        breath = 1.0 + 0.055 * math.sin(s.clock * 1.7)               # gentle breathing
+        amp = 1.0 + (0.10 if s.hover else 0.0) + (s.level * 0.35 if s.mode == "listening" else 0.0)
+        glow = QRadialGradient(c, base * 1.55 * breath * amp)
+        hot = QColor(138, 180, 248, 120 if s.mode != "thinking" else 150)
+        glow.setColorAt(0, hot); glow.setColorAt(.55, QColor(155, 114, 203, 70)); glow.setColorAt(1, QColor(155, 114, 203, 0))
+        p.setPen(Qt.PenStyle.NoPen); p.setBrush(glow); p.drawEllipse(c, base * 1.55 * breath * amp, base * 1.55 * breath * amp)
+        for i in range(3):                                          # soft concentric halo
+            a = int((26 if i == 0 else 16 if i == 1 else 9) * (1.0 + (0.4 if s.hover else 0.0)))
+            p.setBrush(QColor(138, 180, 248, a)); r = base * (1.18 + i * 0.16) * breath
+            p.drawEllipse(c, r, r)
+        p.setBrush(Qt.BrushStyle.NoBrush)                            # orbiting ring, two arcs turning opposite ways
+        ring = base * 1.3 * breath
+        g1 = QConicalGradient(c, s.clock * 70)
+        g1.setColorAt(0, QColor(138, 180, 248, 0)); g1.setColorAt(.55, QColor(138, 180, 248, 60)); g1.setColorAt(1, QColor(155, 114, 203, 210))
+        p.setPen(QPen(g1, 2.4)); p.drawArc(QRectF(c.x() - ring, c.y() - ring, ring * 2, ring * 2), int(s.clock * 90) * 16, 150 * 16)
+        g2 = QConicalGradient(c, -s.clock * 55)
+        g2.setColorAt(0, QColor(255, 255, 255, 0)); g2.setColorAt(1, QColor(255, 255, 255, 120))
+        p.setPen(QPen(g2, 1.2)); p.drawArc(QRectF(c.x() - ring * .82, c.y() - ring * .82, ring * 1.64, ring * 1.64), int(-s.clock * 60) * 16, 110 * 16)
+        r = base * (1.0 + 0.02 * math.sin(s.clock * 3))               # the sphere itself
+        if s.mode == "thinking":
+            sg = QConicalGradient(c, -s.clock * 120)
+            sg.setColorAt(0, QColor("#4285f4")); sg.setColorAt(.5, QColor("#9b72cb")); sg.setColorAt(1, QColor("#4285f4"))
+        else:
+            sg = QRadialGradient(QPointF(c.x() - r * .3, c.y() - r * .35), r * 1.7)
+            sg.setColorAt(0, QColor("#b9d2ff")); sg.setColorAt(.45, QColor("#6c8cf5")); sg.setColorAt(1, QColor("#7b5cd6"))
+        p.setBrush(sg); p.setPen(QPen(QColor(255, 255, 255, 70), 1)); p.drawEllipse(c, r, r)
+        p.setPen(Qt.PenStyle.NoPen); p.setBrush(QColor(255, 255, 255, 46))     # gloss
+        p.drawEllipse(QPointF(c.x() - r * .28, c.y() - r * .34), r * .42, r * .28)
+        s._mark(p, c, r * 0.92)
+
+    @staticmethod
+    def _mark(p, c, r):
+        """A four-point AI sparkle plus a small echo star, drawn in white."""
+        def star(cx, cy, rad, pinch=0.22):
+            path = QPainterPath()
+            path.moveTo(cx, cy - rad)
+            path.quadTo(cx + rad * pinch, cy - rad * pinch, cx + rad, cy)
+            path.quadTo(cx + rad * pinch, cy + rad * pinch, cx, cy + rad)
+            path.quadTo(cx - rad * pinch, cy + rad * pinch, cx - rad, cy)
+            path.quadTo(cx - rad * pinch, cy - rad * pinch, cx, cy - rad)
+            return path
+        p.setPen(Qt.PenStyle.NoPen); p.setBrush(QColor(255, 255, 255, 238))
+        p.drawPath(star(c.x(), c.y(), r * .5))
+        p.setBrush(QColor(255, 255, 255, 190))
+        p.drawPath(star(c.x() + r * .42, c.y() - r * .44, r * .16))
+        p.drawPath(star(c.x() - r * .44, c.y() + r * .40, r * .11))
+
+# ---------- teacher on a whiteboard: animated on-screen explanations ----------
+BOARD_FONT = "Segoe Print"          # handwriting look; Qt falls back to a system font when it is missing
+
+
+class Whiteboard(QWidget):
+    """Full-screen explanation layer: a marker-style step card whose animated pointer line draws itself to the
+    highlighted UI element, with next / previous / read-aloud / dismiss controls."""
+    closed = pyqtSignal()
+    DIM = QColor(6, 9, 16, 96)
+    INK = QColor("#20283a")
+    CREAM = QColor("#fbf7ea")
+    EDGE = QColor("#ddd4bd")
+    ACCENTS = {"explain": QColor("#2f6feb"), "summarize": QColor("#0f9d76"), "translate": QColor("#d9480f")}
+    LABELS = {"explain": "EXPLANATION", "summarize": "SUMMARY", "translate": "TRANSLATION"}
+
+    def __init__(s, screen, steps, kind="explain", cfg=None, speaker=None):
+        super().__init__(None, Qt.WindowType.FramelessWindowHint | Qt.WindowType.WindowStaysOnTopHint | Qt.WindowType.Tool)
+        s.setAttribute(Qt.WidgetAttribute.WA_TranslucentBackground)
+        s.setAttribute(Qt.WidgetAttribute.WA_ShowWithoutActivating)
+        s.setFocusPolicy(Qt.FocusPolicy.StrongFocus); s.setCursor(Qt.CursorShape.ArrowCursor)
+        place_on(s, screen); s.setGeometry(screen.geometry())
+        s.steps = steps or []; s.kind = kind if kind in s.ACCENTS else "explain"
+        s.cfg = cfg or {}; s.speaker = speaker
+        s.i = 0; s.t = 0.0; s.clock = 0.0; s.speak = bool(s.cfg.get("board_speak", True))
+        s.btns = {}; s._press = None; s._g = screen.geometry()
+        s.accent = s.ACCENTS[s.kind]
+        s.anim = QTimer(s); s.anim.timeout.connect(s._tick); s.anim.start(40)
+        QTimer.singleShot(220, s.say_step)
+
+    # --- animation / steps ---
+    def _tick(s):
+        s.t = min(1.0, s.t + 0.05); s.clock += 0.09; s.update()
+        if s.t >= 1.0 and s.anim.interval() != 80: s.anim.setInterval(80)      # settle to a calm pulse once drawn
+
+    def step(s): return s.steps[s.i] if 0 <= s.i < len(s.steps) else {"title": "", "points": [], "target": None}
+
+    def next(s): s.go(1)
+    def prev(s): s.go(-1)
+
+    def go(s, d):
+        n = max(0, min(len(s.steps) - 1, s.i + d))
+        if n == s.i and d > 0: s.close(); return
+        if n != s.i: s.i = n; s.t = 0.0
+        s.say_step(); s.update()
+
+    def say_step(s):
+        if not s.speak or s.speaker is None: return
+        try:
+            if not s.speaker.enabled(): return
+            st = s.step(); line = ". ".join([st.get("title", "")] + [p for p in st.get("points", [])]).strip(". ")
+            if line: s.speaker.say(line)
+        except Exception: pass
+
+    def toggle_speak(s):
+        s.speak = not s.speak
+        if not s.speak:
+            try: s.speaker.stop()
+            except Exception: pass
+        else: s.say_step()
+        s.update()
+
+    # --- layout ---
+    CARD_W = 396
+
+    @staticmethod
+    def bullets_height(st):
+        """Height the bullet block needs - used by both the card size and the painter so nothing overlaps the footer."""
+        fm = QFontMetrics(QFont(BOARD_FONT, 11)); txtw = Whiteboard.CARD_W - 57; h = 0
+        for pt in st.get("points") or []:
+            h += max(24, fm.boundingRect(QRect(0, 0, txtw, 4000), int(Qt.TextFlag.TextWordWrap), "•  " + str(pt)).height() + 10)
+        return h or 26
+
+    def card_size(s):
+        return QSize(s.CARD_W, 126 + s.bullets_height(s.step()))
+
+    def card_rect(s):
+        sz = s.card_size(); W, H = s.width(), s.height(); m = 20
+        tgt = s.step().get("target")
+        if tgt is None:
+            return QRect(W - sz.width() - m, H - sz.height() - m, sz.width(), sz.height())
+        pad = 18
+        cands = [QRect(tgt.right() + pad, tgt.center().y() - sz.height() // 2, sz.width(), sz.height()),
+                 QRect(tgt.left() - pad - sz.width(), tgt.center().y() - sz.height() // 2, sz.width(), sz.height()),
+                 QRect(tgt.center().x() - sz.width() // 2, tgt.top() - pad - sz.height(), sz.width(), sz.height()),
+                 QRect(tgt.center().x() - sz.width() // 2, tgt.bottom() + pad, sz.width(), sz.height())]
+        best = None
+        for r in cands:
+            inner = r.intersected(QRect(m, m, W - 2 * m, H - 2 * m))
+            off = r.width() * r.height() - max(0, inner.width()) * max(0, inner.height())
+            hit = r.intersected(tgt); overlap = max(0, hit.width()) * max(0, hit.height())
+            score = off * 3 + overlap * 2
+            if best is None or score < best[0]: best = (score, r)
+        r = best[1]
+        r.moveLeft(min(max(r.x(), m), max(m, W - sz.width() - m)))
+        r.moveTop(min(max(r.y(), m), max(m, H - sz.height() - m)))
+        return r
+
+    # --- painting ---
+    def paintEvent(s, e):
+        if not s.steps: return
+        p = QPainter(s); p.setRenderHint(QPainter.RenderHint.Antialiasing); p.setRenderHint(QPainter.RenderHint.TextAntialiasing)
+        k = 1 - (1 - min(1.0, s.t)) ** 3                              # ease-out for entrance
+        st = s.step(); tgt = st.get("target"); card = s.card_rect()
+        if tgt is not None: s._spotlight(p, tgt, k)
+        s._card(p, card, k, st)
+        if tgt is not None: s._pointer(p, card, tgt, k)
+
+    def _spotlight(s, p, tgt, k):
+        hole = tgt.adjusted(-12, -12, 12, 12).intersected(s.rect())
+        if hole.isEmpty(): return
+        dim = QColor(s.DIM); dim.setAlpha(int(s.DIM.alpha() * k))
+        p.setPen(Qt.PenStyle.NoPen); p.setBrush(dim)
+        for r in (QRect(0, 0, s.width(), hole.top()), QRect(0, hole.bottom(), s.width(), s.height() - hole.bottom()),
+                  QRect(0, hole.top(), hole.left(), hole.height()), QRect(hole.right(), hole.top(), s.width() - hole.right(), hole.height())):
+            if r.width() > 0 and r.height() > 0: p.fillRect(r, dim)
+        pulse = 0.5 + 0.5 * math.sin(s.clock * 2.4)
+        p.setBrush(Qt.BrushStyle.NoBrush)
+        for i in range(4):                                            # soft marker glow
+            a = int((44 - i * 9) * k); p.setPen(QPen(QColor(255, 209, 102, max(0, a)), 6 - i, Qt.PenStyle.SolidLine, Qt.PenCapStyle.RoundCap, Qt.PenJoinStyle.RoundJoin))
+            p.drawRoundedRect(QRectF(hole).adjusted(-i * 3, -i * 3, i * 3, i * 3), 14, 14)
+        p.setPen(QPen(QColor(255, 209, 102, int(240 * k)), 2.4 + 1.6 * pulse, Qt.PenStyle.SolidLine, Qt.PenCapStyle.RoundCap))
+        p.drawRoundedRect(QRectF(hole), 12, 12)
+        p.setPen(QPen(QColor(47, 111, 235, int(230 * k)), 3.0, Qt.PenStyle.SolidLine, Qt.PenCapStyle.RoundCap))     # corner markers
+        L = 16; corners = [(hole.left(), hole.top(), 1, 1), (hole.right(), hole.top(), -1, 1), (hole.left(), hole.bottom(), 1, -1), (hole.right(), hole.bottom(), -1, -1)]
+        for x, y, dx, dy in corners:
+            p.drawLine(QPointF(x, y), QPointF(x + dx * L, y)); p.drawLine(QPointF(x, y), QPointF(x, y + dy * L))
+
+    @staticmethod
+    def _edge(r, toward):
+        c = r.center(); dx = toward.x() - c.x(); dy = toward.y() - c.y()
+        if dx == 0 and dy == 0: return QPointF(c)
+        sx = (r.width() / 2) / abs(dx) if dx else 1e9
+        sy = (r.height() / 2) / abs(dy) if dy else 1e9
+        kk = min(sx, sy)
+        return QPointF(c.x() + dx * kk, c.y() + dy * kk)
+
+    def _pointer(s, p, card, tgt, k):
+        a = s._edge(card, tgt.center()); b = s._edge(tgt, card.center())
+        dx, dy = b.x() - a.x(), b.y() - a.y(); dist = max(1.0, math.hypot(dx, dy))
+        nx, ny = -dy / dist, dx / dist
+        curve = min(70.0, dist * 0.22)
+        ctrl = QPointF((a.x() + b.x()) / 2 + nx * curve, (a.y() + b.y()) / 2 + ny * curve)
+        path = QPainterPath(a); path.quadTo(ctrl, b)
+        if k <= 0.01: return
+        pts = [path.pointAtPercent(i / 100.0) for i in range(int(100 * k) + 1)]
+        p.setBrush(Qt.BrushStyle.NoBrush)
+        p.setPen(QPen(QColor(255, 255, 255, 120), 7.0, Qt.PenStyle.SolidLine, Qt.PenCapStyle.RoundCap))   # white under-stroke keeps it readable
+        p.drawPolyline(QPolygonF(pts))
+        p.setPen(QPen(QColor(s.accent), 3.2, Qt.PenStyle.SolidLine, Qt.PenCapStyle.RoundCap, Qt.PenJoinStyle.RoundJoin))
+        p.drawPolyline(QPolygonF(pts))
+        p.setPen(Qt.PenStyle.NoPen); p.setBrush(QColor(s.accent))
+        p.drawEllipse(a, 4.2, 4.2)
+        if k > 0.97:                                                  # arrow head at the target
+            ang = math.atan2(b.y() - ctrl.y(), b.x() - ctrl.x()); ln, wd = 15, 6.5
+            head = QPolygonF([b,
+                              QPointF(b.x() - ln * math.cos(ang) + wd * math.sin(ang), b.y() - ln * math.sin(ang) - wd * math.cos(ang)),
+                              QPointF(b.x() - ln * math.cos(ang) - wd * math.sin(ang), b.y() - ln * math.sin(ang) + wd * math.cos(ang))])
+            p.drawPolygon(head)
+
+    def _card(s, p, r, k, st):
+        alpha = min(1.0, k * 1.35); rr = QRectF(r).translated(0, (1 - k) * 16)
+        p.save(); p.setOpacity(alpha)
+        p.setPen(Qt.PenStyle.NoPen); p.setBrush(QColor(3, 6, 12, 70))
+        p.drawRoundedRect(rr.adjusted(-4, 2, 4, 10), 20, 20)                        # drop shadow
+        g = QLinearGradient(rr.topLeft(), rr.bottomLeft()); g.setColorAt(0, QColor("#fdfbf3")); g.setColorAt(1, QColor("#f4eede"))
+        p.setBrush(g); p.setPen(QPen(s.EDGE, 1)); p.drawRoundedRect(rr, 18, 18)
+        p.setPen(Qt.PenStyle.NoPen); p.setBrush(QColor(s.accent)); p.drawRoundedRect(QRectF(rr.x() + 20, rr.y() + 18, 54, 5), 2.5, 2.5)
+        f_lbl = QFont("Segoe UI", 8); f_lbl.setBold(True); f_lbl.setLetterSpacing(QFont.SpacingType.AbsoluteSpacing, 1.6)
+        p.setFont(f_lbl); p.setPen(QColor(s.accent))
+        p.drawText(QRectF(rr.x() + 82, rr.y() + 11, 150, 18), int(Qt.AlignmentFlag.AlignLeft | Qt.AlignmentFlag.AlignVCenter), s.LABELS[s.kind])
+        f_step = QFont("Segoe UI", 8); f_step.setBold(True)
+        p.setFont(f_step); p.setPen(QColor("#8a8270"))
+        p.drawText(QRectF(rr.right() - 92, rr.y() + 11, 72, 18), int(Qt.AlignmentFlag.AlignRight | Qt.AlignmentFlag.AlignVCenter),
+                   f"STEP {s.i + 1}/{len(s.steps)}")
+        f_title = QFont(BOARD_FONT, 15); f_title.setBold(True)
+        p.setFont(f_title); p.setPen(s.INK)
+        tr = QRectF(rr.x() + 22, rr.y() + 36, rr.width() - 44, 30)
+        p.drawText(tr, int(Qt.AlignmentFlag.AlignLeft | Qt.AlignmentFlag.AlignVCenter), st.get("title", "")[:64])
+        f_body = QFont(BOARD_FONT, 11); p.setFont(f_body)
+        txtw = rr.width() - 57
+        y = rr.y() + 70
+        for pt in st.get("points") or []:
+            br = QRectF(rr.x() + 35, y, txtw, 400)
+            h = QFontMetrics(f_body).boundingRect(QRect(int(br.x()), int(y), int(txtw), 400), int(Qt.TextFlag.TextWordWrap), "•  " + str(pt)).height()
+            p.setPen(Qt.PenStyle.NoPen); p.setBrush(QColor(s.accent).lighter(115)); p.drawEllipse(QRectF(rr.x() + 24, y + 8, 5, 5))
+            p.setPen(QColor("#3b4354"))
+            p.drawText(br, int(Qt.TextFlag.TextWordWrap | Qt.AlignmentFlag.AlignLeft | Qt.AlignmentFlag.AlignTop), str(pt))
+            y += max(24, h + 10)
+        if not (st.get("points") or []):
+            p.setPen(QColor("#8a8270")); p.drawText(QRectF(rr.x() + 22, y, rr.width() - 44, 24), int(Qt.AlignmentFlag.AlignLeft), "(no details)")
+        # footer: step dots, then the controls
+        by = rr.y() + 70 + s.bullets_height(st) + 10; s.btns = {}
+        dots = len(s.steps)
+        for d in range(dots):
+            p.setPen(Qt.PenStyle.NoPen); p.setBrush(QColor(s.accent) if d == s.i else QColor("#cfc6b1"))
+            p.drawEllipse(QRectF(rr.x() + 22 + d * 11, by + 10, 6, 6))
+        def btn(key, x, w, label, filled=False):
+            rc = QRectF(x, by, w, 28); s.btns[key] = QRect(int(rc.x()), int(rc.y()), int(rc.width()), int(rc.height()))
+            p.setPen(Qt.PenStyle.NoPen); p.setBrush(QColor(s.accent) if filled else QColor("#e7e0cf"))
+            p.drawRoundedRect(rc, 14, 14)
+            f = QFont("Segoe UI", 9); f.setBold(filled); p.setFont(f)
+            p.setPen(QColor("#ffffff") if filled else QColor("#4a4335"))
+            p.drawText(rc, int(Qt.AlignmentFlag.AlignCenter), label)
+        x = rr.x() + 24 + dots * 11 + 14
+        if s.i > 0: btn("prev", x, 56, "‹ Back"); x += 62
+        if s.i < len(s.steps) - 1: btn("next", x, 62, "Next ›", True)
+        else: btn("next", x, 62, "Done", True)
+        btn("read", rr.right() - 126, 58, "🔊 Read" if s.speak else "🔇 Mute")
+        btn("close", rr.right() - 62, 42, "✕")
+        p.restore()
+
+    # --- interaction ---
+    def mousePressEvent(s, e):
+        if e.button() == Qt.MouseButton.LeftButton: s._press = e.position().toPoint()
+
+    def mouseReleaseEvent(s, e):
+        if s._press is None or e.button() != Qt.MouseButton.LeftButton: return
+        pt = e.position().toPoint(); s._press = None
+        for key, rc in s.btns.items():
+            if rc.adjusted(-2, -2, 2, 2).contains(pt):
+                if key == "prev": s.prev()
+                elif key == "next": s.next()
+                elif key == "read": s.toggle_speak()
+                else: s.close()
+                return
+        if not s.card_rect().contains(pt): s.close()                  # click anywhere else = dismiss
+
+    def keyPressEvent(s, e):
+        if e.key() == Qt.Key.Key_Escape: s.close()
+        elif e.key() in (Qt.Key.Key_Right, Qt.Key.Key_Space, Qt.Key.Key_Down): s.next()
+        elif e.key() in (Qt.Key.Key_Left, Qt.Key.Key_Up): s.prev()
+        elif e.key() == Qt.Key.Key_R: s.toggle_speak()
+
+    def closeEvent(s, e):
+        s.anim.stop(); s.closed.emit(); super().closeEvent(e)
+
+
 # ---------- AI cursor: where the assistant's mouse is while Screen control works ----------
 class AICursor(QWidget):
     """Click-through, always-on-top pointer with a red outline and an 'AI' tag: looks nothing like the system cursor, so you can always
@@ -1931,7 +2357,8 @@ class Selector(QWidget):
 
     def __init__(s, pix, screen):
         super().__init__(None, Qt.WindowType.FramelessWindowHint | Qt.WindowType.WindowStaysOnTopHint | Qt.WindowType.Tool)
-        s.pix = pix; s.a = s.b = None; place_on(s, screen); s.setGeometry(screen.geometry()); s.setCursor(Qt.CursorShape.CrossCursor)
+        s.pix = pix; s.a = s.b = None; s.rect_logical = None
+        place_on(s, screen); s.setGeometry(screen.geometry()); s.setCursor(Qt.CursorShape.CrossCursor)
         s.setMouseTracking(True)
 
     def sel(s): return QRect(s.a, s.b).normalized() if s.a and s.b else None
@@ -1954,7 +2381,9 @@ class Selector(QWidget):
 
     def mouseReleaseEvent(s, e):
         if s.a is None: return                    # release without a press (stray event) must not close the selector
-        r = s.sel(); s.finish(s.pix.copy(s.src(r)) if r and r.width() > 10 and r.height() > 10 else None)
+        r = s.sel()
+        s.rect_logical = QRect(r).translated(s.geometry().topLeft()) if r and r.width() > 10 and r.height() > 10 else None
+        s.finish(s.pix.copy(s.src(r)) if r and r.width() > 10 and r.height() > 10 else None)
 
     def keyPressEvent(s, e):
         if e.key() == Qt.Key.Key_Escape: s.finish(None)
@@ -2410,7 +2839,7 @@ class Overlay(QWidget):
     partial = pyqtSignal(int, str); finished = pyqtSignal(int, bool); heard = pyqtSignal(int, str)
     ai_cur = pyqtSignal(int, int, str); open_conn = pyqtSignal(); gui_sig = pyqtSignal(object)
     acts_done = pyqtSignal(int, object); note = pyqtSignal(str); open_settings = pyqtSignal(); served = pyqtSignal(int, str); launched = pyqtSignal(int, object, object); fast = pyqtSignal(int, object, str)
-    W_BASE, DRAWER_W, H_COMPACT, H_FULL = 820, 300, 150, 540
+    W_BASE, DRAWER_W, H_COMPACT, H_FULL = 940, 300, 150, 540
     W = property(lambda s: s.W_BASE + (s.DRAWER_W if getattr(s, "_drawer_on", False) else 0))   # grows when the notification drawer is open
 
     def __init__(s, cfg, memory, vault):
@@ -2449,6 +2878,7 @@ class Overlay(QWidget):
         top = QHBoxLayout(); s.orb = Orb(); top.addWidget(s.orb)
         s.status = QLabel("Ready - tap 🎤 or type"); top.addWidget(s.status, 1)
         s.b_sum = QPushButton("Summarize"); s.b_area = QPushButton("Select area")
+        s.b_exp = QPushButton("Explain"); s.b_tr = QPushButton("Translate")
         s.b_scr = QPushButton("Screen control"); s.b_scr.setCheckable(True)
         s.b_can = QPushButton("Canvas"); s.b_bell = QPushButton("🔔"); s.b_snd = QPushButton("🔊"); s.b_snd.setCheckable(True); s.b_snd.setChecked(not cfg.get("muted"))
         s.b_set = QPushButton("⚙"); s.b_x = QPushButton("✕")
@@ -2457,8 +2887,10 @@ class Overlay(QWidget):
         s.b_area.setToolTip("Pick a region for the assistant to look at (read-only)")
         s.b_scr.setToolTip("Live mode: fresh screenshot every turn; the assistant can click, drag, scroll and type.\nStop anytime with the emergency-stop hotkey.")
         s.b_snd.setToolTip("Spoken replies on/off")
-        for b in (s.b_sum, s.b_area, s.b_scr, s.b_can, s.b_bell, s.b_snd, s.b_set, s.b_x):
+        for b in (s.b_exp, s.b_tr, s.b_sum, s.b_area, s.b_scr, s.b_can, s.b_bell, s.b_snd, s.b_set, s.b_x):
             b.setCursor(Qt.CursorShape.PointingHandCursor); top.addWidget(b)
+        s.b_exp.setToolTip("Whiteboard explanation of this screen (or the selected area): steps + arrows to the exact elements")
+        s.b_tr.setToolTip("Translate the text on this screen (or the selected area) on the whiteboard")
         lay.addLayout(top)
         s.out = QTextBrowser(); s.out.setOpenExternalLinks(True); s.out.hide(); lay.addWidget(s.out, 1)
         s.execl = QLabel(""); s.execl.setObjectName("execl"); s.execl.setWordWrap(True); s.execl.setTextFormat(Qt.TextFormat.RichText); s.execl.hide(); lay.addWidget(s.execl)
@@ -2467,9 +2899,11 @@ class Overlay(QWidget):
         s.thumb = QLabel(); s.thumb.setFixedSize(84, 52); s.thumb.setObjectName("thumb"); cv.addWidget(s.thumb)
         ct = QVBoxLayout(); ct.setSpacing(4); cl = QLabel("Asking about the selected area"); cl.setObjectName("chiptitle"); ct.addWidget(cl)
         qrow = QHBoxLayout(); qrow.setSpacing(6)
-        for label, prompt in (("Explain", "Explain what is in this area."), ("Summarize", "Summarize this area briefly."),
-                              ("Translate", "Translate the text in this area (to English, or to Hebrew if it is already English)."), ("Extract text", "Extract all the text in this area exactly.")):
-            qb = QPushButton(label); qb.setObjectName("quick"); qb.setCursor(Qt.CursorShape.PointingHandCursor); qb.clicked.connect(lambda _, p=prompt: s.user_ask(text=p)); qrow.addWidget(qb)
+        for label, prompt, kind in (("Explain", "Explain what is in this area.", "explain"), ("Summarize", "Summarize this area briefly.", "summarize"),
+                                    ("Translate", "Translate the text in this area (to English, or to Hebrew if it is already English).", "translate"),
+                                    ("Extract text", "Extract all the text in this area exactly.", None)):
+            qb = QPushButton(label); qb.setObjectName("quick"); qb.setCursor(Qt.CursorShape.PointingHandCursor)
+            qb.clicked.connect(lambda _, p=prompt, k=kind: s.board_ask(k, p) if k else s.user_ask(text=p)); qrow.addWidget(qb)
         qrow.addStretch(1); ct.addLayout(qrow); cv.addLayout(ct, 1)
         cx = QPushButton("✕"); cx.setObjectName("chipx"); cx.setFixedSize(26, 26); cx.setToolTip("Remove the area"); cx.clicked.connect(lambda: s.set_region(None)); cv.addWidget(cx, 0, Qt.AlignmentFlag.AlignTop)
         lay.addWidget(s.chip)
@@ -2480,6 +2914,7 @@ class Overlay(QWidget):
         s.b_x.clicked.connect(s.close_overlay)
         s.b_set.clicked.connect(s.request_settings)
         s.b_sum.clicked.connect(s.summarize); s.b_area.clicked.connect(s.select_area)
+        s.b_exp.clicked.connect(s.explain); s.b_tr.clicked.connect(s.translate)
         s.b_scr.toggled.connect(s.on_screen_toggle); s.b_can.clicked.connect(s.show_canvas); s.b_bell.clicked.connect(lambda: s.toggle_drawer())
         s.b_snd.toggled.connect(s.on_sound_toggle); s.b_mic.clicked.connect(s.mic_clicked)
         s.edit.returnPressed.connect(s.submit_text)
@@ -2487,6 +2922,16 @@ class Overlay(QWidget):
         s.ai_cur.connect(s.on_ai_cursor); s.gui_sig.connect(lambda fn: fn())
         s.acts_done.connect(s.on_acts_done); s.note.connect(s.on_note); s.served.connect(s.on_served); s.launched.connect(s.on_launched); s.fast.connect(s.on_fast)
         s.timer = QTimer(s); s.timer.timeout.connect(s.tick)        # started on open, stopped on close
+
+        # --- collapsed AI orb state + on-screen explanation layer ---
+        s._collapsed = False; s._leave_at = 0.0; s._dragging = False; s._expand_t = 0.0; s._seen_inside = False
+        s.board = None; s.region_rect = None; s._map = None
+        s.outer = outer
+        s.big = AIOrb(96)
+        s.collapsed = QWidget(); cbox = QVBoxLayout(s.collapsed); cbox.setContentsMargins(0, 0, 0, 0)
+        cbox.addWidget(s.big, 0, Qt.AlignmentFlag.AlignCenter); s.collapsed.hide(); outer.addWidget(s.collapsed)
+        s.big.clicked.connect(lambda: s.expand(activate=True)); s.big.move_by.connect(s.orb_moved); s.big.released.connect(s.orb_dropped)
+        s.watch = QTimer(s); s.watch.timeout.connect(s.watch_cursor); s.watch.start(120)    # orb hover expand / leave collapse
 
     # --- geometry / animation ---
     def screen_now(s):
@@ -2503,14 +2948,83 @@ class Overlay(QWidget):
         a = s.screen_now().availableGeometry(); w = min(s.W, a.width() - 24)
         return QRect(a.center().x() - w // 2, a.bottom() - h + 1 - 12, w, h)
 
+    def orb_rect(s, size=ORB_WIN):
+        return orb_rect(s.cfg, s.screen_now(), size)
+
+    def orb_hit(s, pos):
+        return s.geometry().adjusted(-6, -6, 6, 6).contains(pos)
+
     def apply_display(s):
         """Settings changed the target monitor: move an open overlay there now."""
         s.scr = resolve_screen(s.cfg)
         if s.isVisible() and not s._closing:
-            place_on(s, s.scr); s.setGeometry(s.target(s.height() or s.H_COMPACT))
+            place_on(s, s.scr)
+            s.setGeometry(s.orb_rect() if s._collapsed else s.target(s.height() or s.H_COMPACT))
 
     def request_settings(s):
         s.close_overlay(); QTimer.singleShot(260, s.open_settings.emit)     # open AFTER the click is fully finished and the overlay is gone
+
+    # --- collapsed orb <-> full panel ---
+    def expand(s, activate=False):
+        """Orb -> full overlay controls, growing out of where the orb sits."""
+        if not s.isVisible() or s._closing: return
+        if not s._collapsed:
+            if activate: s.activateWindow(); s.raise_(); s.edit.setFocus()
+            return
+        s._collapsed = False; s._leave_at = 0.0; s._expand_t = time.time(); s._seen_inside = False
+        s.outer.setContentsMargins(16, 16, 16, 16)
+        s.collapsed.hide(); s._panel.show()
+        s.setGeometry(s.orb_rect()); s.setWindowOpacity(1.0)
+        s.run(s.target(s.want_h()), None, None, 260)
+        s.raise_()
+        if activate: s.activateWindow(); force_foreground(s); s.edit.setFocus()
+
+    def collapse(s, force=False):
+        """Full overlay -> tiny orb again (fades and shrinks into the orb)."""
+        if s._collapsed or s._closing or not s.isVisible(): return
+        if not force and s._busy(): return
+        s._collapsed = True; s._leave_at = 0.0
+        s.run(s.orb_rect(), 0.0, s._collapsed_done, 240)
+
+    def _collapsed_done(s):
+        if not s._collapsed or s._closing: return
+        QToolTip.hideText()
+        s.outer.setContentsMargins(8, 8, 8, 8)
+        s._panel.hide(); s.collapsed.show(); s.setGeometry(s.orb_rect())
+        s.setWindowOpacity(0.0); s.run(s.orb_rect(), 1.0, None, 170)
+
+    def _busy(s):
+        """Reasons to stay open while the pointer is away (typing, listening, thinking, a dialog or the board)."""
+        return (s.state in ("listening", "thinking") or s.edit.hasFocus() or s.rec.stream is not None
+                or (s.board is not None and s.board.isVisible()) or s.sel is not None or s._drawer_on)
+
+    def watch_cursor(s):
+        """Hover the orb -> expand; move off the panel -> collapse back to the orb."""
+        if not s.isVisible() or s._closing or s._dragging: return
+        pos = QCursor.pos()
+        if s._collapsed:
+            if s.cfg.get("orb_hover_expand", True) and s.orb_hit(pos): s.expand()
+            return
+        if s.geometry().adjusted(-8, -8, 8, 8).contains(pos):
+            s._seen_inside = True; s._leave_at = 0.0; return
+        now = time.time()
+        if s.orb_hit(pos): s._leave_at = 0.0; return        # still parked on the orb's spot: expanding it again would just flicker
+        if s._busy(): s._leave_at = 0.0; return
+        if not s._leave_at: s._leave_at = now
+        elif now - s._leave_at > 0.6: s.collapse()
+
+    def orb_moved(s, dx, dy):
+        s._dragging = True
+        g = s.geometry().translated(dx, dy); a = s.screen_now().availableGeometry()
+        g.moveLeft(min(max(g.x(), a.x() - 8), a.right() - 24)); g.moveTop(min(max(g.y(), a.y() - 8), a.bottom() - 24))
+        s.setGeometry(g)
+
+    def orb_dropped(s):
+        s._dragging = False
+        g = s.geometry(); s.cfg["orb_position"] = "custom"
+        s.cfg["orb_x"], s.cfg["orb_y"] = g.x(), g.y()
+        try: save_cfg(s.cfg)
+        except Exception: pass
 
     def run(s, rect, opacity=None, done=None, ms=280):
         if s._grp is not None:                          # a stale group used to fire hide() after a quick re-open -> window vanished / clicks lost
@@ -2526,7 +3040,12 @@ class Overlay(QWidget):
         s._grp = g; g.start()
 
     def is_open(s): return s.isVisible() and not s._closing and s.windowOpacity() > 0.5
-    def toggle(s): s.close_overlay() if s.is_open() else s.open_overlay()
+
+    def toggle(s):
+        if not s.isVisible(): s.open_overlay()
+        elif s._collapsed: s.expand(activate=True)
+        elif s.is_open(): s.close_overlay()
+        else: s.open_overlay()
 
     def open_overlay(s, listen=None):
         s._notice_only = False; s.repairs = 0; s.fail_streak = False; s.execl.hide(); s.exec_lines = []; s.ai_cursor_hide()
@@ -2538,21 +3057,29 @@ class Overlay(QWidget):
         if not s.timer.isActive(): s.timer.start(33)
         prov = s.speaker.provider()
         warm([p["url"] for p in s.cfg["providers"]] + ([s.cfg["tts_url"]] if prov == "openai" else ["https://api.elevenlabs.io"] if prov == "elevenlabs" else []))
-        end = s.target(s.H_COMPACT); start = QRect(end); start.translate(0, 70)
-        place_on(s, s.scr); s.setGeometry(start); s.setWindowOpacity(0); s.show(); s.raise_(); s.activateWindow(); force_foreground(s)
-        s.run(end, 1.0)
+        s.close_board()
+        s._collapsed = True; s._leave_at = 0.0; s._dragging = False; s._expand_t = time.time(); s._seen_inside = False
+        s.outer.setContentsMargins(8, 8, 8, 8)
+        s._panel.hide(); s.collapsed.show()
+        place_on(s, s.scr); s.setGeometry(s.orb_rect()); s.setWindowOpacity(0)
+        s.show(); s.raise_()                                    # the orb must not steal focus from the app underneath
+        s.run(s.orb_rect(), 1.0)
+        if s.orb_hit(QCursor.pos()): QTimer.singleShot(180, s.expand)
         if listen is None: listen = s.cfg.get("listen_mode", "manual") == "auto"      # default: the mic only turns on when YOU tap it
         if listen: s.start_listening()
         else: s.set_state("idle", "Ready - tap 🎤 or type")
 
     def close_overlay(s):
-        QToolTip.hideText(); s.req += 1; s.speaker.stop(); s.stop_ev.set(); s.ai_cursor_hide()
+        QToolTip.hideText(); s.req += 1; s.speaker.stop(); s.stop_ev.set(); s.ai_cursor_hide(); s.close_board()
         if s.rec.stream: s.rec.stop()
         s._stealth = False; s.state = "idle"; s.orb.mode = "idle"; s._closing = True
-        end = QRect(s.geometry()); end.translate(0, 70); s.run(end, 0.0, s._finish_close, 220)
+        s._collapsed = False; s._leave_at = 0.0
+        end = QRect(s.geometry()); end.translate(0, 40); s.run(end, 0.0, s._finish_close, 220)
 
     def _finish_close(s):
-        if s._closing: s.hide(); s.timer.stop(); QToolTip.hideText()
+        if s._closing:
+            s.hide(); s.timer.stop(); QToolTip.hideText()
+            s.collapsed.hide(); s._panel.show(); s.outer.setContentsMargins(16, 16, 16, 16)
 
     def keyPressEvent(s, e):
         if e.key() == Qt.Key.Key_Escape:
@@ -2560,7 +3087,7 @@ class Overlay(QWidget):
             else: s.close_overlay()
 
     def emergency_stop(s):
-        s.stop_ev.set(); s.req += 1; s.speaker.stop(); s.ai_cursor_hide()
+        s.stop_ev.set(); s.req += 1; s.speaker.stop(); s.ai_cursor_hide(); s.close_board()
         if s.rec.stream: s.rec.stop()
         s._unstealth(); s.set_state("idle", "⛔ Stopped")
 
@@ -2570,7 +3097,7 @@ class Overlay(QWidget):
     # --- hotkeys / small handlers ---
     def hotkey_summarize(s):
         if not s.is_open(): s.open_overlay(listen=False)
-        s.summarize()
+        s.expand(activate=True); s.summarize()
 
     def hotkey_area(s): s.select_area()
 
@@ -2590,13 +3117,14 @@ class Overlay(QWidget):
 
     def region_from_canvas(s, pix):
         if not s.isVisible(): s.open_overlay(listen=False)
-        s.region = pix; s.b_scr.blockSignals(True); s.b_scr.setChecked(False); s.b_scr.blockSignals(False)
+        s.region = pix; s.region_rect = None; s.expand()
+        s.b_scr.blockSignals(True); s.b_scr.setChecked(False); s.b_scr.blockSignals(False)
         s.b_area.setText("Canvas ✓"); s.activateWindow(); s.edit.setFocus()
         s.set_state("idle", "Canvas attached - ask about it")
 
     # --- voice ---
     def set_state(s, st, text):
-        s.state = st; s.orb.mode = st; s.status.setText(text)
+        s.state = st; s.orb.mode = st; s.big.mode = st; s.status.setText(text)
         s.b_mic.setStyleSheet("background:#c62839;color:#fff" if st == "listening" else "")           # red mic = the microphone is ON
 
     def start_listening(s):
@@ -2616,7 +3144,7 @@ class Overlay(QWidget):
 
     def tick(s):
         if not s.isVisible(): return
-        s.orb.level = s.rec.level; s._tickn += 1
+        s.orb.level = s.big.level = s.rec.level; s._tickn += 1
         if s.state != "idle" or s.rec.level > 0.02 or s._tickn % 3 == 0: s.orb.update()      # idle orb repaints at 1/3 rate
         if s.state == "listening":
             r = s.rec; now = time.time()
@@ -2690,10 +3218,57 @@ class Overlay(QWidget):
         if was: s._stealth = False; s.show()
         cb(pix)
 
-    def summarize(s):
-        s.speaker.stop(); s.set_state("thinking", "Reading screen…")
-        if s.region: s.ask(text=SUMMARY_PROMPT, pix=s.region, kind="summarize")
-        else: s.snap_screen(lambda pix: s.ask(text=SUMMARY_PROMPT, pix=pix, kind="summarize"))
+    def summarize(s): s.board_ask("summarize", SUMMARY_PROMPT, "Reading screen…")
+    def explain(s): s.board_ask("explain", PROMPT_EXPLAIN, "Looking at your screen…")
+    def translate(s): s.board_ask("translate", PROMPT_TRANSLATE, "Reading the text…")
+
+    def board_ask(s, kind, text, status="Reading screen…"):
+        """Explain / summarize / translate -> a whiteboard walkthrough of the screen (or the selected area)."""
+        s.speaker.stop(); s.close_board(); s.set_state("thinking", status)
+        if s.region: s.ask(text=text, pix=s.region, kind=kind)
+        else:
+            s.set_state("thinking", "Reading screen…")
+            s.snap_screen(lambda pix: s.ask(text=text, pix=pix, kind=kind, screen=True))
+
+    # --- whiteboard explanations (teacher-on-a-canvas layer) ---
+    def board_target(s, r):
+        """Rect in screenshot/image pixels -> Qt logical screen pixels for the on-screen highlight."""
+        if r is None: return None
+        m = getattr(s, "_map", None)
+        if not m: return None
+        try:
+            if m["mode"] == "screen":
+                sx = m["ox"] + r.x() * m["k"]; sy = m["oy"] + r.y() * m["k"]
+                sc = m.get("sc") or s.screen_now(); d = sc.devicePixelRatio() or 1.0
+                pos = s._to_logical(sx, sy)
+                if pos is None: return None
+                return QRect(round(pos[1]), round(pos[2]), max(8, round(r.width() * m["k"] / d)), max(8, round(r.height() * m["k"] / d)))
+            rr = QRect(m["rect"]); kx = rr.width() / m["iw"]; ky = rr.height() / m["ih"]
+            return QRect(round(rr.x() + r.x() * kx), round(rr.y() + r.y() * ky), max(8, round(r.width() * kx)), max(8, round(r.height() * ky)))
+        except Exception:
+            return None
+
+    def show_board(s, steps, kind):
+        s.close_board()
+        m = getattr(s, "_map", None) or {}
+        sc = m.get("sc")
+        if sc is None and m.get("mode") == "region":
+            sc = next((q for q in QGuiApplication.screens() if q.geometry().contains(m["rect"].center())), None)
+        sc = sc or s.screen_now(); g = sc.geometry()
+        for st in steps:
+            r = s.board_target(st.get("target"))
+            st["target"] = r.translated(-g.x(), -g.y()) if r is not None else None
+        b = Whiteboard(sc, steps, kind, s.cfg, s.speaker)
+        b.closed.connect(s._board_closed); s.board = b
+        b.show(); b.raise_(); b.setFocus()
+
+    def close_board(s):
+        b, s.board = s.board, None
+        if b is not None:
+            try: b.close()
+            except Exception: pass
+
+    def _board_closed(s): s.board = None
 
     def select_area(s):
         if s.rec.stream: s.rec.stop()
@@ -2706,6 +3281,7 @@ class Overlay(QWidget):
         s.sel.show(); s.sel.raise_(); s.sel.activateWindow(); force_foreground(s.sel); s.sel.setFocus()
 
     def region_done(s, pix):
+        rect = getattr(s.sel, "rect_logical", None) if s.sel is not None else None
         s.sel = None
         if not s.isVisible():
             if pix is None: return
@@ -2714,28 +3290,32 @@ class Overlay(QWidget):
         if pix is None:
             if s.cfg.get("listen_mode", "manual") == "auto": s.start_listening()
             return
+        s.region_rect = rect
         s.b_scr.blockSignals(True); s.b_scr.setChecked(False); s.b_scr.blockSignals(False)
+        s.expand(activate=True)
         s.set_region(pix); force_foreground(s); s.edit.setFocus()                    # ready to type right away (no auto-listening)
         s.set_state("idle", "Area selected. Type your question, or tap a quick action.")
 
     def set_region(s, pix):
         s.region = pix
         if pix is None:
+            s.region_rect = None
             s.b_area.setText("Select area"); s.chip.hide(); s.edit.setPlaceholderText("Ask anything, or just speak…")
-            if s.isVisible() and not s._closing and s.out.isHidden(): s.run(s.target(s.want_h()), None, None, 180)
+            if s.isVisible() and not s._closing and not s._collapsed and s.out.isHidden(): s.run(s.target(s.want_h()), None, None, 180)
             return
         s.b_area.setText("Area ✓"); s.chip.show(); s.edit.setPlaceholderText("Ask about the selected area…")
         s.thumb.setPixmap(pix.scaled(84, 52, Qt.AspectRatioMode.KeepAspectRatio, Qt.TransformationMode.SmoothTransformation))
-        if s.isVisible() and not s._closing: s.run(s.target(s.want_h()), None, None, 200)
+        if s.isVisible() and not s._closing and not s._collapsed: s.run(s.target(s.want_h()), None, None, 200)
 
     # --- notification drawer ---
     def toggle_drawer(s, show=None):
         """Show/hide ONLY the notification layer. Nothing underneath is reset: messages, reply, windows and panels stay as they were."""
         on = (not s._drawer_on) if show is None else bool(show)
         if on == s._drawer_on: return
+        if on and s._collapsed: s.expand(activate=True)
         s._drawer_on = on; s.drawer.setVisible(on)
         if on: s._unread = 0; s._bell(); s.dempty.setVisible(not s.notices); s._conn_line()
-        if s.isVisible() and not s._closing:
+        if s.isVisible() and not s._closing and not s._collapsed:
             s.run(s.target(s.want_h()), None, None, 220)         # closing returns to the height the content itself needs
         if not on and s._notice_only: s._notice_only = False; s.close_overlay()      # opened just to read notifications: hide again as before
 
@@ -2768,6 +3348,7 @@ class Overlay(QWidget):
             if n.id == nid and getattr(n, "_card", None) is not None: n._card.set_result(ok, err)
 
     def paintEvent(s, e):                         # soft shadow around the panel (cheap, no graphics effect)
+        if s._panel.isHidden(): return            # collapsed: only the orb is on screen
         p = QPainter(s); p.setRenderHint(QPainter.RenderHint.Antialiasing); p.setPen(Qt.PenStyle.NoPen); r = QRectF(s._panel.geometry())
         for i in range(10):
             p.setBrush(QColor(0, 0, 0, int(34 * (1 - i / 10) ** 2))); p.drawRoundedRect(r.adjusted(-i, -i + 4, i, i + 4), 24 + i, 24 + i)
@@ -2801,7 +3382,7 @@ class Overlay(QWidget):
         sp = SYSTEM_BASE
         persona = PERSONAS.get(s.cfg.get("voice_persona", "default"), PERSONAS["default"])[1]
         if persona: sp += " Personality: " + persona + " Keep it light and short; it changes only your wording, never accuracy, action blocks, or what you report about results."
-        if kind == "summarize": sp += " This is a read-only summary request: do not emit action blocks."
+        if kind in BOARD_KINDS: sp += BOARD_DOC
         else:
             sp += "\n\n" + ACTIONS_DOC
             sp += "\n\nMonitors (physical px):\n" + monitor_text(s._sc if screen else None)
@@ -2824,9 +3405,13 @@ class Overlay(QWidget):
         if not provs:
             s.set_state("idle", "No provider"); s.partial.emit(rid, "⚠️ Add a provider + API key in ⚙ Settings → Providers."); return
         img = prep_image(pix, grid=screen) if pix is not None else None
+        s.meta = None; s._map = None
         if screen and pix is not None and s._sc is not None:        # map screenshot px -> real screen px for clicks
             px, py, pw, ph = phys_rect(s._sc)             # physical origin of THIS monitor (correct with mixed DPI / negative offsets)
             s.meta = {"ox": px, "oy": py, "k": pw / img.width(), "w": pw, "h": ph}
+            s._map = {"mode": "screen", "sc": s._sc, **s.meta}
+        elif img is not None and getattr(s, "region_rect", None) is not None:
+            s._map = {"mode": "region", "rect": QRect(s.region_rect), "iw": max(1, img.width()), "ih": max(1, img.height())}
         note = text or "(spoken question)"
         if img is not None: note += " [screen attached]"
         s.pending = {"role": "user", "content": note}; s.reply = ""; s.kind = kind
@@ -2851,6 +3436,7 @@ class Overlay(QWidget):
         b64 = img_to_b64(req["img"]) if req["img"] is not None else None
         a64 = base64.b64encode(audio).decode() if audio else None
         chunker = Chunker(s.speaker.say) if s.speaker.enabled() else None
+        clean = (lambda t: strip_board(strip_actions(t))) if kind in BOARD_KINDS else strip_actions
         for p in provs:
             name = p["name"]
             if b64 and not p.get("vision", True): errs.append(f"{name}: no image support"); continue
@@ -2887,13 +3473,13 @@ class Overlay(QWidget):
                     d = ch[0].get("delta", {}).get("content") if ch else None
                     if d:
                         acc += d; s.partial.emit(rid, acc)
-                        if chunker: chunker.feed(strip_actions(acc))
+                        if chunker: chunker.feed(clean(acc))
                         if kind == "chat" and "```" in d:        # the first complete action block ends the reply: run it NOW instead of waiting for the model to finish chatting
                             end = next((m.end() for m in ACT_RE.finditer(acc) if parse_actions(m.group(0))), None)
                             if end: acc = acc[:end]; r.close(); break
                 if acc:
                     s.served.emit(rid, s.usage.served(p, list(dict.fromkeys(e.split(':')[0] for e in errs if not e.startswith('Speech')))))
-                    if chunker and rid == s.req: chunker.feed(strip_actions(acc), final=True)
+                    if chunker and rid == s.req: chunker.feed(clean(acc), final=True)
                     s.partial.emit(rid, acc); s.finished.emit(rid, True); return
                 errs.append(f"{name}: {failed or 'empty response'}")
             except Exception as ex:
@@ -2916,18 +3502,25 @@ class Overlay(QWidget):
         if rid != s.req: return
         s.reply = txt
         if s.state == "thinking": s.set_state("idle", "Answering…")
-        s.out.setMarkdown(strip_actions(txt).strip() or "…")
+        if s._collapsed:                                                   # never hide the answer behind the orb
+            if s.kind in BOARD_KINDS: return                               # the whiteboard presents it instead
+            s.expand()
+        s.out.setMarkdown((strip_board(txt) if s.kind in BOARD_KINDS else strip_actions(txt)).strip() or "…")
         if s.out.isHidden(): s.out.show(); s.run(s.target(s.want_h()), None)
         sb = s.out.verticalScrollBar(); sb.setValue(sb.maximum())
 
     def on_finished(s, rid, ok):
         if rid != s.req: return
         if not ok: s._unstealth(); s.set_state("idle", "Something went wrong"); return
-        vis = strip_actions(s.reply).strip()
+        vis = (strip_board(s.reply) if s.kind in BOARD_KINDS else strip_actions(s.reply)).strip()
         acts = parse_actions(s.reply) if s.kind == "chat" else []
         if s.pending:
             tag = " [actions: " + ", ".join(str(a.get("do")) for a in acts) + "]" if acts else ""
             s.messages = (s.messages + [s.pending, {"role": "assistant", "content": (vis + tag) or "(done)"}])[-24:]
+        if s.kind in BOARD_KINDS:
+            steps = parse_board(s.reply)
+            if steps: s.show_board(steps, s.kind)
+            elif s._collapsed: s.expand()                                  # no board came back: show the text answer
         if acts: s.handle_actions(rid, acts); return
         if s.kind == "chat" and not getattr(s, "_last_auto", False) and s.repairs < 1 and s.step < s.cfg["max_steps"] and claims_action(s.reply):
             s.repairs += 1       # it SAID it was doing something but produced no action: demand the action instead of letting it pretend
@@ -3757,12 +4350,28 @@ class Settings(QDialog):
         s.disp = QComboBox(); row = QHBoxLayout(); ident = QPushButton("Identify monitors"); ident.clicked.connect(s.identify_screens)
         row.addWidget(s.disp, 1); row.addWidget(ident); f1.addRow("Open overlay on", row)
         s.disp_info = hint_label(""); v1.addWidget(s.disp_info)
-        c2, f2, v2 = mk_card("How it works")
-        v2.addWidget(hint_label("“Follow the mouse cursor” opens on whichever monitor the pointer is on when you press the hotkey. The monitor is then "
+        c2, f2, v2 = mk_card("AI orb position", "The overlay opens as a small animated AI orb; hovering it reveals the controls and moving away "
+                                                   "collapses them again. Pick where the orb sits - or drag the orb itself and it is saved as a custom spot.")
+        s.opos = QComboBox()
+        for key, label in ORB_PLACES: s.opos.addItem(label, key)
+        s.ox = QSpinBox(); s.oy = QSpinBox()
+        for sp in (s.ox, s.oy): sp.setRange(0, 20000); sp.setSingleStep(10); sp.setSuffix(" px")
+        crow = QHBoxLayout(); crow.setSpacing(8)
+        for lbl, sp in (("X", s.ox), ("Y", s.oy)):
+            q = QLabel(lbl); q.setObjectName("hint"); crow.addWidget(q); crow.addWidget(sp)
+        crow.addStretch(); f2.addRow("Orb position", s.opos); f2.addRow("Custom coordinates", crow)
+        s.opos.currentIndexChanged.connect(s._orb_coords_state)
+        s.board_speak = Switch("Read explanation steps aloud"); f2.addRow("", s.board_speak)
+        c3, f3, v3 = mk_card("How it works")
+        v3.addWidget(hint_label("“Follow the mouse cursor” opens on whichever monitor the pointer is on when you press the hotkey. The monitor is then "
                                 "kept for that session, so Screen control stays on the same display even while it moves the mouse. "
                                 "If a chosen monitor is unplugged, the overlay falls back to the cursor's monitor. The emergency-stop screen corners "
                                 "refer to the primary monitor."))
-        return mk_page("Display", c1, c2)
+        return mk_page("Display", c1, c2, c3)
+
+    def _orb_coords_state(s):
+        custom = s.opos.currentData() == "custom"
+        s.ox.setEnabled(custom); s.oy.setEnabled(custom)
 
     def _memory(s):
         c, f, v = mk_card("Long-term memory"); s.memory_panel = MemoryPanel(s.app.memory); v.addWidget(s.memory_panel)
@@ -3850,6 +4459,9 @@ class Settings(QDialog):
         s.vault_ai.setChecked(bool(c.get("vault_ai", True))); s.vsess.setCurrentIndex(max(0, s.vsess.findData(int(c.get("vault_session_min", 5)))))
         s._snap = {k: c.get(k) for k in s.VOICE_KEYS}; s._saved = False; s.refresh_voices(); s.vault_status()
         s.refresh_displays(c.get("display", "cursor")); s.memory_panel.refresh(); s.load_conns(); s.status.setText("")
+        s.opos.setCurrentIndex(max(0, s.opos.findData(c.get("orb_position", "bottom-right"))))
+        s.ox.setValue(max(0, int(c.get("orb_x", 0) or 0))); s.oy.setValue(max(0, int(c.get("orb_y", 0) or 0)))
+        s.board_speak.setChecked(bool(c.get("board_speak", True))); s._orb_coords_state()
 
     VOICE_KEYS = ("tts_provider", "tts_key", "tts_voice", "tts_model", "tts_url", "voice_style", "voice_persona", "voice_rate", "voice_name", "muted")
 
@@ -3964,7 +4576,8 @@ class Settings(QDialog):
                          stt_key=s.skey.text(), stt_model=s.smodel.text().strip(), display=s.disp.currentData() or "cursor",
                          muted=not s.speak_on.isChecked(), speak_notices=s.spk_notices.isChecked(), voice_style=s.vstyle.currentData(), voice_persona=s.persona.currentData(),
                          voice_rate=s.vrate.value(), voice_name=s.vname.currentData() or "", listen_mode=s.listen.currentData(), vault_ai=s.vault_ai.isChecked(),
-                         vault_session_min=s.vsess.currentData(), **combos)
+                         vault_session_min=s.vsess.currentData(), orb_position=s.opos.currentData() or "bottom-right",
+                         orb_x=s.ox.value(), orb_y=s.oy.value(), board_speak=s.board_speak.isChecked(), **combos)
         s.app.vault.session_min = int(s.vsess.currentData())
         if s.app.vault.session_min == 0: s.app.vault.lock_now()
         s._saved = True; s.app.ov.b_snd.blockSignals(True); s.app.ov.b_snd.setChecked(s.speak_on.isChecked()); s.app.ov.b_snd.blockSignals(False)
