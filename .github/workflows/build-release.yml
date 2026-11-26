@@ -32,8 +32,8 @@ jobs:
       - name: Set app version
         shell: bash
         run: |
-          sed -i "s/^APP_VERSION = .*/APP_VERSION = \"1.0.${{ github.run_number }}\"/" ai_overlay.py
-          grep "^APP_VERSION" ai_overlay.py
+          sed -i "s/^APP_VERSION = .*/APP_VERSION = \"1.0.${{ github.run_number }}\"/" ai_overlay_lib/core.py
+          grep "^APP_VERSION" ai_overlay_lib/core.py
 
       - name: Build Windows EXE
         run: >-

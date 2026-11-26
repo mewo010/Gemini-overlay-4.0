@@ -14,7 +14,7 @@ The patch number comes from the GitHub Actions run number, so each new workflow 
 
 ## Repository setup
 
-1. Put `ai_overlay.py`, `requirements.txt`, `.gitignore`, `README.md`, and `.github/workflows/build-release.yml` in the root of your GitHub repository. Keep the `.github` folder and workflow filename exactly as shown.
+1. Put `ai_overlay.py`, the `ai_overlay_lib/` folder, `requirements.txt`, `.gitignore`, `README.md`, and `.github/workflows/build-release.yml` in the root of your GitHub repository. Keep the `.github` folder, the `ai_overlay_lib/` folder and workflow filename exactly as shown. `ai_overlay.py` is the entry point; the rest of the app lives in `ai_overlay_lib/`.
 2. Make sure the default branch is named `main`. If your branch is named `master` or something else, update the branch under `on.push.branches` in the workflow.
 3. In GitHub, open **Settings → Actions → General → Workflow permissions** and enable **Read and write permissions** if organization/repository policy allows it. The workflow declares `contents: write` to let `GITHUB_TOKEN` create releases.
 4. Commit and push the workflow to `main`.
