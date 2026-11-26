@@ -14,6 +14,8 @@ What's new
   * "Open / close Spotify, Chrome, Google, YouTube, Notepad ..." by voice or text.
   * Collapsible AI orb: the overlay opens as a breathing, glowing orb docked where you like (Settings > Orb, or drag it);
     hovering opens the controls, which stay open. While the AI thinks it morphs back to the orb with a compact status pill.
+    The chat grows out of the orb and folds back into it; one shared accent colour (or independent orb / chat colours)
+    tints the orb, its glow, the pill, the chat panel, its focus ring, buttons and highlights - all live, no restart.
   * Explain / Summarize / Translate draw a teacher-on-a-whiteboard walkthrough: step cards, an animated pointer line
     and a highlighted frame on the exact element, with next / back / read-aloud / dismiss controls.
 
@@ -39,7 +41,7 @@ try:
     from cryptography.hazmat.primitives.kdf.scrypt import Scrypt
 except Exception:
     Fernet = None
-from PyQt6.QtCore import (Qt, QRect, QRectF, QTimer, QObject, pyqtSignal, QPropertyAnimation,
+from PyQt6.QtCore import (Qt, QRect, QRectF, QTimer, QObject, pyqtSignal, QPropertyAnimation, QVariantAnimation,
                           QParallelAnimationGroup, QEasingCurve, QBuffer, QByteArray, QPointF, QEvent, QSize, QMimeData)
 from PyQt6.QtWidgets import QToolTip
 from PyQt6.QtGui import (QPainter, QColor, QPen, QCursor, QGuiApplication, QRadialGradient, QConicalGradient,
@@ -116,6 +118,8 @@ DEFAULTS = {
     "orb_color": "#6c8cf5",          # accent of the orb, its glow, the thinking pill and the speaking waves
     "orb_size": "medium",            # small | medium | large (see ORB_SIZES)
     "orb_hover_expand": True,        # hover the orb to reveal the full overlay controls (the overlay then stays open)
+    "orb_theme_shared": True,        # one colour for the orb AND the chat; off = each has its own accent
+    "chat_color": "#6c8cf5",         # accent of the opened chat panel (only used when orb_theme_shared is off)
     "board_speak": True,             # read the whiteboard explanation steps aloud
 }
 HK_LABELS = [("hk_toggle", "Open / close overlay"), ("hk_summarize", "Summarize screen"),
@@ -131,6 +135,47 @@ ORB_PLACES = [("bottom-right", "Bottom right"), ("bottom-left", "Bottom left"), 
 ORB_SIZES = [("small", "Small", 0.78), ("medium", "Medium", 1.0), ("large", "Large", 1.30)]
 ORB_COLORS = [("#6c8cf5", "Aurora blue"), ("#8b5cf6", "Violet"), ("#0ea5e9", "Azure"),
               ("#10b981", "Emerald"), ("#f97316", "Sunset"), ("#ec4899", "Rose"), ("#94a3b8", "Graphite")]
+ORB_SIZE_KEYS = {k for k, _l, _f in ORB_SIZES}
+ORB_PLACE_KEYS = {k for k, _l in ORB_PLACES}
+ORB_MARGIN = 14                                   # gap between the orb and the screen edges
+
+
+def _as_int(v, default=0, lo=-100000, hi=100000):
+    """A tolerant int (stored settings are hand-editable JSON), clamped to a sane range."""
+    try: n = int(round(float(v)))
+    except Exception: n = default
+    return max(lo, min(hi, n))
+
+
+def _as_bool(v, default=True):
+    if isinstance(v, bool): return v
+    if isinstance(v, str): return v.strip().lower() not in ("0", "false", "no", "off", "")
+    if v is None: return default
+    return bool(v)
+
+
+def _valid_color(v, fallback="#6c8cf5"):
+    """A QColor from a stored value, never an invalid one."""
+    c = QColor(str(v or "").strip())
+    return c if c.isValid() else QColor(fallback)
+
+
+def normalize_orb(cfg):
+    """Validate every Orb / colour setting IN PLACE and return it.
+
+    This is the single source of truth: a corrupt or out-of-range value in config.json (or an old config from an
+    earlier version) can never make the orb invisible, zero-sized or stuck off-screen - it is repaired here."""
+    pos = str(cfg.get("orb_position", "bottom-right") or "")
+    cfg["orb_position"] = pos if pos in ORB_PLACE_KEYS else "bottom-right"
+    size = str(cfg.get("orb_size", "medium") or "")
+    cfg["orb_size"] = size if size in ORB_SIZE_KEYS else "medium"
+    cfg["orb_color"] = _valid_color(cfg.get("orb_color"), "#6c8cf5").name()
+    cfg["orb_x"] = _as_int(cfg.get("orb_x", -1), -1)          # -1 = no saved spot yet (any real coordinate is kept)
+    cfg["orb_y"] = _as_int(cfg.get("orb_y", -1), -1)
+    cfg["orb_hover_expand"] = _as_bool(cfg.get("orb_hover_expand"), True)
+    cfg["orb_theme_shared"] = _as_bool(cfg.get("orb_theme_shared"), True)
+    cfg["chat_color"] = _valid_color(cfg.get("chat_color"), cfg["orb_color"]).name()
+    return cfg
 
 
 def orb_window(cfg, base=ORB_WIN):
@@ -142,21 +187,45 @@ def orb_window(cfg, base=ORB_WIN):
 
 def orb_color(cfg, fallback="#6c8cf5"):
     """The configured orb accent, falling back to the default when the stored value is not a colour."""
-    c = QColor(str(cfg.get("orb_color", "") or ""))
-    return c if c.isValid() else QColor(fallback)
+    return _valid_color(cfg.get("orb_color"), fallback)
+
+
+def chat_color(cfg):
+    """Accent of the opened chat: the orb's accent while the theme is shared, its own colour otherwise."""
+    if _as_bool(cfg.get("orb_theme_shared"), True): return orb_color(cfg)
+    return _valid_color(cfg.get("chat_color"), orb_color(cfg).name())
+
+
+def mix_color(a, b, t):
+    """Blend two colours (t=0 -> a, t=1 -> b)."""
+    t = max(0.0, min(1.0, t))
+    return QColor(int(a.red() + (b.red() - a.red()) * t), int(a.green() + (b.green() - a.green()) * t),
+                  int(a.blue() + (b.blue() - a.blue()) * t))
+
+
+def _clamp_to_screen(r, m=ORB_MARGIN):
+    """Clamp a rect fully inside the available area of the closest screen, so a saved position is always reachable."""
+    screens = QGuiApplication.screens()
+    if not screens: return r
+    def dist(sc):
+        g = sc.availableGeometry().center(); return (g.x() - r.center().x()) ** 2 + (g.y() - r.center().y()) ** 2
+    g = min(screens, key=dist).availableGeometry()
+    r = QRect(r)
+    r.moveLeft(max(g.x() + m, min(r.x(), g.right() - r.width() - m + 1)))
+    r.moveTop(max(g.y() + m, min(r.y(), g.bottom() - r.height() - m + 1)))
+    return r
 
 
 def orb_rect(cfg, screen, size=None):
-    """Where the collapsed orb lives: a saved corner / side / center, or custom coordinates (clamped onto a screen)."""
+    """Where the collapsed orb lives: a saved corner / side / center, or custom coordinates kept on a screen.
+
+    Whatever is stored, the result is always a fully visible square inside some monitor's available geometry."""
     if size is None: size = orb_window(cfg)
-    a = screen.availableGeometry(); m = 14; place = cfg.get("orb_position", "bottom-right")
+    if screen is None: screen = QGuiApplication.primaryScreen()
+    a = screen.availableGeometry(); m = ORB_MARGIN; place = cfg.get("orb_position", "bottom-right")
     if place == "custom":
-        x, y = int(cfg.get("orb_x", -1)), int(cfg.get("orb_y", -1))
-        if x >= 0 and y >= 0:
-            for sc in QGuiApplication.screens():              # keep custom coordinates reachable after a monitor change
-                g = sc.availableGeometry()
-                if g.intersects(QRect(x, y, size, size)): return QRect(x, y, size, size)
-            return QRect(a.x() + a.width() - size - m, a.y() + a.height() - size - m, size, size)
+        x, y = _as_int(cfg.get("orb_x", -1), -1), _as_int(cfg.get("orb_y", -1), -1)
+        if x != -1 or y != -1: return _clamp_to_screen(QRect(x, y, size, size), m)
         place = "bottom-right"
     left = "left" in place; right = "right" in place; top = "top" in place; bottom = "bottom" in place
     x = a.x() + m if left else (a.x() + a.width() - size - m if right else a.x() + (a.width() - size) // 2)
@@ -178,10 +247,12 @@ def load_cfg():
         if gk: cfg["providers"].append(make_provider("Gemini", key=gk, **({"model": legacy["gemini_model"]} if legacy["gemini_model"] else {})))
     if not cfg["tts_key"]:
         cfg["tts_key"] = os.getenv("ELEVENLABS_API_KEY", "")
+    normalize_orb(cfg)
     return cfg
 
 
 def save_cfg(cfg):
+    normalize_orb(cfg)                                # never persist a value that could hide the orb
     json.dump(cfg, open(CFG_PATH, "w", encoding="utf-8"), indent=2)
 
 
@@ -2005,18 +2076,25 @@ class Speaker:
 
 # ---------- animated orb ----------
 class Orb(QWidget):
+    """The small status dot in the chat's top row - tinted with the chat accent so the panel matches the big orb."""
     def __init__(s):
         super().__init__(); s.setFixedSize(46, 46); s.mode = "idle"; s.level = 0.0; s.t = 0.0
+        s.color = QColor("#6c8cf5")
+
+    def set_color(s, color):
+        c = color if isinstance(color, QColor) else QColor(str(color))
+        if c.isValid(): s.color = c; s.update()
 
     def paintEvent(s, e):
         s.t += 0.08
         p = QPainter(s); p.setRenderHint(QPainter.RenderHint.Antialiasing); c = QPointF(23, 23)
+        accent, light, deep = s.color, s.color.lighter(155), s.color.darker(145)
         if s.mode == "thinking":
             g = QConicalGradient(c, -s.t * 90)
-            g.setColorAt(0, QColor("#4285f4")); g.setColorAt(.5, QColor("#9b72cb")); g.setColorAt(1, QColor("#4285f4"))
+            g.setColorAt(0, accent); g.setColorAt(.5, light); g.setColorAt(1, accent)
             r = 13 + 2 * math.sin(s.t * 2)
         else:
-            g = QRadialGradient(c, 22); g.setColorAt(0, QColor("#8ab4f8")); g.setColorAt(1, QColor("#9b72cb"))
+            g = QRadialGradient(c, 22); g.setColorAt(0, light); g.setColorAt(1, deep)
             r = 12 + (s.level * 10 if s.mode == "listening" else 1.5 * math.sin(s.t))
         p.setPen(Qt.PenStyle.NoPen); p.setBrush(g); p.drawEllipse(c, r, r)
 
@@ -2031,10 +2109,15 @@ class AIOrb(QWidget):
         s.setFixedSize(size, size); s.setCursor(Qt.CursorShape.PointingHandCursor)
         s.setToolTip("AI Overlay - hover to open  ·  drag to move")
         s.mode = "idle"; s.level = 0.0; s.clock = 0.0; s.hover = False; s._drag = None; s._moved = False
+        s.hv = 0.0; s.bob = 0.0                    # eased hover amount + slow idle float (no snapping)
         c = QColor(color); s.color = c if c.isValid() else QColor("#6c8cf5")
         s.anim = QTimer(s); s.anim.timeout.connect(s._tick); s.anim.start(33)
 
-    def _tick(s): s.clock += 0.045; s.update()
+    def _tick(s):
+        s.clock += 0.045
+        s.hv += ((1.0 if s.hover else 0.0) - s.hv) * 0.16        # ~0.2 s ease towards hover / rest
+        s.bob = 1.5 * math.sin(s.clock * 0.62)                   # a slow 8-second drift, like it is floating
+        s.update()
 
     def set_color(s, color):
         c = color if isinstance(color, QColor) else QColor(str(color))
@@ -2060,11 +2143,11 @@ class AIOrb(QWidget):
 
     def paintEvent(s, e):
         p = QPainter(s); p.setRenderHint(QPainter.RenderHint.Antialiasing)
-        w = s.width(); c = QPointF(w / 2, w / 2); base = w * 0.32
+        w = s.width(); c = QPointF(w / 2, w / 2 + s.bob); base = w * 0.32
         accent = s.color; light = accent.lighter(160); deep = accent.darker(150)
         speaking = s.mode == "speaking"
         breath = 1.0 + 0.055 * math.sin(s.clock * 1.7)               # gentle breathing
-        amp = 1.0 + (0.10 if s.hover else 0.0) + (s.level * 0.35 if s.mode == "listening" else 0.0)
+        amp = 1.0 + 0.10 * s.hv + (s.level * 0.35 if s.mode == "listening" else 0.0)
         if speaking: amp += 0.10 + 0.06 * math.sin(s.clock * 4.2)
         glow = QRadialGradient(c, base * 1.55 * breath * amp)
         hot = QColor(accent); hot.setAlpha(160 if speaking else 120 if s.mode != "thinking" else 150)
@@ -2072,7 +2155,7 @@ class AIOrb(QWidget):
         glow.setColorAt(0, hot); glow.setColorAt(.55, mid); glow.setColorAt(1, QColor(deep.red(), deep.green(), deep.blue(), 0))
         p.setPen(Qt.PenStyle.NoPen); p.setBrush(glow); p.drawEllipse(c, base * 1.55 * breath * amp, base * 1.55 * breath * amp)
         for i in range(3):                                          # soft concentric halo
-            a = int((26 if i == 0 else 16 if i == 1 else 9) * (1.0 + (0.4 if s.hover else 0.0) + (0.35 if speaking else 0.0)))
+            a = int((26 if i == 0 else 16 if i == 1 else 9) * (1.0 + (0.4 * s.hv) + (0.35 if speaking else 0.0)))
             hc = QColor(light); hc.setAlpha(a); p.setBrush(hc); r = base * (1.18 + i * 0.16) * breath
             p.drawEllipse(c, r, r)
         if speaking:                                                 # fluid voice rings around the orb
@@ -2924,33 +3007,63 @@ class NoticeCard(QFrame):
         if ok: s.ed.clear()
 
 
-OVERLAY_QSS = """
-    #panel{background:qlineargradient(x1:0,y1:0,x2:0,y2:1,stop:0 #1f222b,stop:1 #16181e);border:1px solid #2c313d;border-radius:24px}
+PANEL_RADIUS = 24
+
+
+def panel_surface(accent):
+    """The chat panel's own surface - gradient stops, edge and corner radius - described in ONE place.
+
+    overlay_qss() styles the real #panel from this and Overlay.paintEvent() paints the ghost that grows out
+    of the orb from it, so the unfolding capsule can never drift away from the panel it becomes."""
+    a = QColor(accent) if QColor(accent).isValid() else QColor("#6c8cf5")
+    return {"top": mix_color(QColor("#1f222b"), a, 0.10), "bot": mix_color(QColor("#16181e"), a, 0.06),
+            "edge": mix_color(QColor("#2c313d"), a, 0.32), "radius": PANEL_RADIUS}
+
+
+def overlay_qss(accent):
+    """The chat panel's stylesheet, generated from its accent colour so the Orb and the Chat share one theme.
+
+    Every surface stays dark and legible; the accent only tints the panel, its edge, the focus ring, selection,
+    checked buttons and the small highlight labels - the same places the Orb's glow uses that colour."""
+    a = QColor(accent) if QColor(accent).isValid() else QColor("#6c8cf5")
+    surf = panel_surface(accent)
+    vals = {
+        "accent": a.name(), "light": a.lighter(145).name(), "pale": a.lighter(185).name(),
+        "top": surf["top"].name(), "bot": surf["bot"].name(), "edge": surf["edge"].name(),
+        "rad": str(surf["radius"]), "field": mix_color(QColor("#12141a"), a, 0.06).name(),
+        "soft": mix_color(QColor("#272b36"), a, 0.08).name(), "hover": mix_color(QColor("#31364a"), a, 0.14).name(),
+        "chip": mix_color(QColor("#1b1e27"), a, 0.14).name(), "quick": mix_color(QColor("#232842"), a, 0.30).name(),
+        "quick2": mix_color(QColor("#2e3560"), a, 0.30).name(), "drawer": mix_color(QColor("#13151b"), a, 0.07).name(),
+        "bar": mix_color(QColor("#303546"), a, 0.22).name()}
+    qss = """
+    #panel{background:qlineargradient(x1:0,y1:0,x2:0,y2:1,stop:0 @top@,stop:1 @bot@);border:1px solid @edge@;border-radius:@rad@px}
     QLabel{color:#9aa3b8;font:13px 'Segoe UI'}
-    QPushButton{background:#272b36;color:#e8ebf4;border:none;border-radius:14px;padding:6px 13px;font:12px 'Segoe UI'}
-    QPushButton:hover{background:#31364a} QPushButton:pressed{background:#222633}
-    QPushButton:checked{background:qlineargradient(x1:0,y1:0,x2:1,y2:0,stop:0 #4f6df5,stop:1 #7a5cf0);color:#fff}
-    QLineEdit{background:#12141a;color:#eef1fa;border:1px solid #272b38;border-radius:17px;padding:9px 16px;font:14px 'Segoe UI';selection-background-color:#4f6df5}
-    QLineEdit:focus{border:1px solid #4f6df5}
+    QPushButton{background:@soft@;color:#e8ebf4;border:none;border-radius:14px;padding:6px 13px;font:12px 'Segoe UI'}
+    QPushButton:hover{background:@hover@} QPushButton:pressed{background:#222633}
+    QPushButton:checked{background:qlineargradient(x1:0,y1:0,x2:1,y2:0,stop:0 @accent@,stop:1 @light@);color:#fff}
+    QLineEdit{background:@field@;color:#eef1fa;border:1px solid #272b38;border-radius:17px;padding:9px 16px;font:14px 'Segoe UI';selection-background-color:@accent@}
+    QLineEdit:focus{border:1px solid @accent@}
     QTextBrowser{background:transparent;color:#e8ebf4;border:none;font:14px 'Segoe UI'}
-    QLabel#src{color:#8ab4f8;font:11px 'Segoe UI'} QLabel#execl{background:#171a22;border:1px solid #272b38;border-radius:10px;padding:7px 10px;color:#c3c9d9;font:12px 'Segoe UI'}
+    QLabel#src{color:@light@;font:11px 'Segoe UI'} QLabel#execl{background:@chip@;border:1px solid @edge@;border-radius:10px;padding:7px 10px;color:#c3c9d9;font:12px 'Segoe UI'}
     QPushButton#mic_live{background:#c62839;color:#fff}
-    QFrame#chip{background:#1b1e27;border:1px solid #2c313d;border-radius:14px}
-    QLabel#thumb{background:#0f1116;border-radius:8px} QLabel#chiptitle{color:#c9d1ff;font:600 12px 'Segoe UI'}
-    QPushButton#quick{background:#232842;color:#bcc6ff;border-radius:11px;padding:4px 11px;font:11px 'Segoe UI'} QPushButton#quick:hover{background:#2e3560}
+    QFrame#chip{background:@chip@;border:1px solid @edge@;border-radius:14px}
+    QLabel#thumb{background:#0f1116;border-radius:8px} QLabel#chiptitle{color:@pale@;font:600 12px 'Segoe UI'}
+    QPushButton#quick{background:@quick@;color:@pale@;border-radius:11px;padding:4px 11px;font:11px 'Segoe UI'} QPushButton#quick:hover{background:@quick2@}
     QPushButton#chipx,QPushButton#nx{background:transparent;color:#7d869c;padding:0;border-radius:11px} QPushButton#chipx:hover,QPushButton#nx:hover{background:#2b3040;color:#fff}
-    QFrame#drawer{background:#13151b;border-left:1px solid #262a36;border-top-right-radius:24px;border-bottom-right-radius:24px}
+    QFrame#drawer{background:@drawer@;border-left:1px solid @edge@;border-top-right-radius:@rad@px;border-bottom-right-radius:@rad@px}
     QLabel#dtitle{color:#fff;font:600 14px 'Segoe UI'} QLabel#dempty{color:#6f778c;font:12px 'Segoe UI'}
-    QPushButton#link{background:transparent;color:#8ab4f8;padding:2px 6px;font:11px 'Segoe UI'} QPushButton#link:hover{color:#fff}
-    QFrame#ncard{background:#1b1e27;border:1px solid #2a2f3c;border-radius:14px}
-    QLabel#napp{color:#8ab4f8;font:600 11px 'Segoe UI'} QLabel#ntime{color:#6f778c;font:11px 'Segoe UI'}
+    QPushButton#link{background:transparent;color:@light@;padding:2px 6px;font:11px 'Segoe UI'} QPushButton#link:hover{color:#fff}
+    QFrame#ncard{background:@chip@;border:1px solid @edge@;border-radius:14px}
+    QLabel#napp{color:@light@;font:600 11px 'Segoe UI'} QLabel#ntime{color:#6f778c;font:11px 'Segoe UI'}
     QLabel#ntitle{color:#fff;font:600 13px 'Segoe UI'} QLabel#nbody{color:#c3c9d9;font:12px 'Segoe UI'} QLabel#nres{color:#7be3c0;font:11px 'Segoe UI'}
     QLineEdit#nreply{border-radius:13px;padding:5px 11px;font:12px 'Segoe UI'}
-    QPushButton#nsend{background:#4f6df5;color:#fff;border-radius:14px;padding:0;font:600 14px 'Segoe UI'} QPushButton#nsend:hover{background:#6a84ff}
+    QPushButton#nsend{background:@accent@;color:#fff;border-radius:14px;padding:0;font:600 14px 'Segoe UI'} QPushButton#nsend:hover{background:@light@}
     QScrollArea,QScrollArea>QWidget>QWidget{background:transparent;border:none}
-    QScrollBar:vertical{background:transparent;width:8px} QScrollBar::handle:vertical{background:#303546;border-radius:4px;min-height:24px}
+    QScrollBar:vertical{background:transparent;width:8px} QScrollBar::handle:vertical{background:@bar@;border-radius:4px;min-height:24px}
     QScrollBar::add-line,QScrollBar::sub-line{height:0}
-    QToolTip{background:#1b1e27;color:#e8ebf4;border:1px solid #2a2e3b;padding:5px}"""
+    QToolTip{background:@chip@;color:#e8ebf4;border:1px solid @edge@;padding:5px}"""
+    for k, v in vals.items(): qss = qss.replace("@" + k + "@", v)
+    return qss
 
 
 class Overlay(QWidget):
@@ -2964,11 +3077,12 @@ class Overlay(QWidget):
         super().__init__()
         s.cfg, s.memory, s.vault = cfg, memory, vault
         s.setWindowFlags(Qt.WindowType.FramelessWindowHint | Qt.WindowType.WindowStaysOnTopHint | Qt.WindowType.Tool)
+        s.setMinimumSize(0, 0)          # the window must be able to shrink to the orb, so the chat can grow out of it
         s.setAttribute(Qt.WidgetAttribute.WA_TranslucentBackground)
         s.setAttribute(Qt.WidgetAttribute.WA_ShowWithoutActivating)      # re-showing mid-automation must not steal focus
         s.rec = Recorder(); s.speaker = Speaker(cfg); s.speaker.err_cb = s.note.emit
         s.messages = []; s.pending = None; s.reply = ""; s.kind = "chat"
-        s.region = None; s.state = "idle"; s.req = 0; s.sel = None; s._grp = None; s.canvas = None
+        s.region = None; s.state = "idle"; s.req = 0; s.sel = None; s._grp = None; s._grp_done = None; s.canvas = None
         s.cool = {}; s.step = 0; s.stop_ev = threading.Event(); s._stealth = False; s._sc = None; s.meta = None
         s.cur = AICursor(); s._cur_scr = None; s._cur_was = False; s._scr_cache = []; s._cur_dim = QTimer(s); s._cur_dim.setSingleShot(True)
         s._cur_dim.timeout.connect(lambda: s.cur.setWindowOpacity(0.45)); s._notice_only = False; s.repairs = 0; s.recoveries = 0; s._last_auto = False; s.exec_lines = []; s.fail_streak = False; s._run_t0 = 0.0
@@ -3027,7 +3141,7 @@ class Overlay(QWidget):
         lay.addWidget(s.chip)
         bot = QHBoxLayout(); s.edit = QLineEdit(); s.edit.setPlaceholderText("Ask anything, or just speak…")
         s.b_mic = QPushButton("🎤"); s.b_mic.setFixedWidth(40); bot.addWidget(s.edit, 1); bot.addWidget(s.b_mic); lay.addLayout(bot)
-        s.setStyleSheet(OVERLAY_QSS)
+        s.setStyleSheet(overlay_qss(chat_color(s.cfg)))
 
         s.b_x.clicked.connect(s.close_overlay)
         s.b_set.clicked.connect(s.request_settings)
@@ -3043,6 +3157,8 @@ class Overlay(QWidget):
 
         # --- collapsed AI orb state + on-screen explanation layer ---
         s._collapsed = False; s._leave_at = 0.0; s._dragging = False; s._expand_t = 0.0; s._seen_inside = False
+        s._think_from_open = False; s._bloom = 0.0; s._bloom_anim = None
+        s._ghost = False                                                    # the panel surface painted while it is still growing                                                       # accent halo while the chat grows out of the orb
         s.board = None; s.region_rect = None; s._map = None
         s.outer = outer
         s.big = AIOrb(orb_window(s.cfg), orb_color(s.cfg))
@@ -3074,13 +3190,18 @@ class Overlay(QWidget):
 
     def target(s, h):
         """The expanded panel, anchored to the side/corner the orb was docked on (not always bottom-center)."""
-        a = s.screen_now().availableGeometry(); w = min(s.W, a.width() - 24); m = 10; o = s.orb_rect()
+        a = s.screen_now().availableGeometry(); m = 10; o = s.orb_rect()
+        pm, mg = s._panel_min(), s.outer.contentsMargins()      # never ask for less than the controls need
+        need_w = max(s.outer.minimumSize().width(), pm.width() + mg.left() + mg.right())
+        need_h = max(s.outer.minimumSize().height(), pm.height() + mg.top() + mg.bottom())
+        w = min(max(s.W, need_w), a.width() - 24)
+        h = min(max(h, need_h), a.height() - 16)
         x = a.x() + 12 if o.center().x() < a.center().x() else a.right() - w - 12
         y = o.bottom() + m if o.center().y() < a.center().y() else o.top() - h - m
         x = max(a.x() + 8, min(x, a.right() - w - 8)); y = max(a.y() + 8, min(y, a.bottom() - h - 8))
         return QRect(x, y, w, h)
 
-    def orb_rect(s, size=ORB_WIN):
+    def orb_rect(s, size=None):
         return orb_rect(s.cfg, s.screen_now(), size)
 
     def orb_hit(s, pos):
@@ -3092,20 +3213,49 @@ class Overlay(QWidget):
         if s.isVisible() and not s._closing: place_on(s, s.scr)
         s.apply_orb_style()
 
+    def apply_theme(s):
+        """Re-render the chat from its accent (shared with the orb or independent), live, no restart."""
+        qss = overlay_qss(chat_color(s.cfg))
+        if qss != s.styleSheet(): s.setStyleSheet(qss); s.update()
+        s.orb.set_color(chat_color(s.cfg))
+
+    def _min_for(s, collapsed):
+        """Keep the window's minimum in step with its form: exactly the orb when collapsed, free when expanded
+        (target() still sizes the panel for its contents), so the chat can always grow out of the orb."""
+        if collapsed:
+            w = orb_window(s.cfg); s.setMinimumSize(w, w)
+        else:
+            s.setMinimumSize(0, 0)
+
     def apply_orb_style(s):
-        """Apply the Orb settings (size / colour / position) immediately, without waiting for a restart."""
-        size = orb_window(s.cfg)
-        if s.big.width() != size: s.big.setFixedSize(size, size)
-        s.big.set_color(orb_color(s.cfg))
+        """Apply the Orb settings (size / colour / position / theme) immediately, without waiting for a restart.
+
+        Safe in every state: it never hides the window, never sets a zero size and never leaves the orb off-screen
+        (orb_rect() clamps a saved position onto a real monitor)."""
+        normalize_orb(s.cfg)
+        size, accent = orb_window(s.cfg), orb_color(s.cfg)
+        if s.big.width() != size:
+            s.big.setFixedSize(size, size); s.outer.invalidate(); s.outer.activate()   # drop the stale layout minimum
+        s.big.set_color(accent)
         if s.pill is not None:
-            s.pill.set_color(orb_color(s.cfg))
+            s.pill.set_color(accent)
             if s.pill.isVisible(): s._place_pill()
-        if s.isVisible() and not s._closing:
-            s.setGeometry(s.orb_rect() if s._collapsed else s.target(s.height() or s.want_h()))
+        s.apply_theme()
+        if not s.isVisible(): return                                   # the next open() uses the new settings
+        if s._closing: return                                        # mid-close: keep the exit quiet
+        if s._collapsed:
+            s.outer.setContentsMargins(0, 0, 0, 0); s._min_for(True)
+            s.collapsed.show(); s._panel.hide()
+            s.setGeometry(s.orb_rect())
+            s.setWindowOpacity(1.0)
+        else:
+            s.outer.setContentsMargins(16, 16, 16, 16); s._min_for(False)
+            s.setGeometry(s.target(max(s.height(), s.want_h())))     # never shrink a reply that is already showing
+        s.raise_()
 
     # --- thinking pill beside the orb ---
     def _place_pill(s):
-        if s.pill is not None: s.pill.follow(s.orb_rect(), s.screen_now().availableGeometry())
+        if s.pill is not None: s.pill.follow(s.orb_rect(size=orb_window(s.cfg)), s.screen_now().availableGeometry())
 
     def show_pill(s, text):
         if s.pill is None: s.pill = StatusPill(orb_color(s.cfg))
@@ -3120,34 +3270,66 @@ class Overlay(QWidget):
         s.close_overlay(); QTimer.singleShot(260, s.open_settings.emit)     # open AFTER the click is fully finished and the overlay is gone
 
     # --- collapsed orb <-> full panel ---
+    def bloom(s, ms=520):
+        """A soft accent halo that spreads from the orb as the chat grows out of it (fades out by itself)."""
+        if s._bloom_anim is not None:
+            try: s._bloom_anim.stop(); s._bloom_anim.deleteLater()
+            except Exception: pass
+        a = QVariantAnimation(s); a.setStartValue(0.0); a.setEndValue(1.0); a.setDuration(ms)
+        a.setEasingCurve(QEasingCurve.Type.OutCubic)
+        a.valueChanged.connect(lambda v: s._set_bloom(float(v)))
+        a.finished.connect(lambda: s._set_bloom(0.0))
+        s._bloom_anim = a; s._set_bloom(0.02); a.start()
+
+    def _set_bloom(s, v):
+        s._bloom = max(0.0, min(1.0, v)); s.update()
+
     def expand(s, activate=False):
-        """Orb -> full overlay controls, growing out of where the orb sits."""
+        """Orb -> full chat: the surface unfolds from exactly where the orb sits (OutQuint, no bounce, no overshoot)."""
         if not s.isVisible() or s._closing: return
         if not s._collapsed:
             if activate: s.activateWindow(); s.raise_(); s.edit.setFocus()
             return
         s._collapsed = False; s._leave_at = 0.0; s._expand_t = time.time(); s._seen_inside = False; s._think_collapsed = False; s._seen_full = True
         s.hide_pill()
-        s.outer.setContentsMargins(16, 16, 16, 16)
-        s.collapsed.hide(); s._panel.show()
-        s.setGeometry(s.orb_rect()); s.setWindowOpacity(1.0)
-        s.run(s.target(s.want_h()), None, None, 260)
+        s.outer.setContentsMargins(16, 16, 16, 16); s._min_for(False)
+        s.collapsed.hide(); s._panel.hide()
+        s._ghost = True                                                   # paint the panel surface while it grows, so it
+        s.setGeometry(s.orb_rect()); s.setWindowOpacity(0.0)              # can truly unfold out of the orb
+        s.run(s.target(s.want_h()), 1.0, s._reveal_panel, 440, QEasingCurve.Type.OutQuint, fade_ms=240)
+        s.bloom(440)
         s.raise_()
         if activate: s.activateWindow(); force_foreground(s); s.edit.setFocus()
 
     def collapse(s, force=False):
-        """Full overlay -> tiny orb again (fades and shrinks into the orb)."""
+        """Full chat -> tiny orb again: it shrinks back into the exact orb and hands its glow over."""
         if s._collapsed or s._closing or not s.isVisible(): return
         if not force and s._busy(): return
-        s._collapsed = True; s._leave_at = 0.0
-        s.run(s.orb_rect(), 0.0, s._collapsed_done, 240)
+        s._collapsed = True; s._leave_at = 0.0; s._ghost = False; s._min_for(False)
+        s.run(s.orb_rect(), 0.0, s._collapsed_done, 260, QEasingCurve.Type.InOutCubic, fade_ms=240)
+
+    def _reveal_panel(s):
+        """The window has finished growing: swap the painted surface for the real controls."""
+        s._ghost = False
+        if s._collapsed or s._closing: return
+        s._panel.show()
+        s.setGeometry(s.target(max(s.height(), s.want_h())))
+        s.update()
+
+    def _panel_min(s):
+        """Minimum size the real panel needs (works while it is hidden, so the grow animation knows its goal)."""
+        lay = s._panel.layout()
+        try:
+            if lay is not None: lay.activate(); return lay.minimumSize()
+        except Exception: pass
+        return QSize(0, 0)
 
     def _collapsed_done(s):
         if not s._collapsed or s._closing: return
         QToolTip.hideText()
-        s.outer.setContentsMargins(8, 8, 8, 8)
-        s._panel.hide(); s.collapsed.show(); s.setGeometry(s.orb_rect())
-        s.setWindowOpacity(0.0); s.run(s.orb_rect(), 1.0, None, 170)
+        s.outer.setContentsMargins(0, 0, 0, 0)                    # the orb paints its own glow; no layout inset
+        s._panel.hide(); s.collapsed.show(); s.outer.activate(); s._min_for(True); s.setGeometry(s.orb_rect())
+        s.setWindowOpacity(0.0); s.run(s.orb_rect(), 1.0, None, 220, QEasingCurve.Type.OutCubic)
 
     def _busy(s):
         """Reasons to stay open while the pointer is away (typing, listening, thinking, a dialog or the board)."""
@@ -3172,18 +3354,32 @@ class Overlay(QWidget):
         try: save_cfg(s.cfg)
         except Exception: pass
 
-    def run(s, rect, opacity=None, done=None, ms=280):
+    def run(s, rect, opacity=None, done=None, ms=280, curve=None, fade_ms=None):
+        """Animate geometry (+ optional opacity) as one group, so a stale group can never hide a fresh window.
+
+        A later animation that has no completion of its own (a reply streaming in while the chat is still
+        unfolding, which starts a new grow animation) inherits the interrupted one's completion, so the
+        window always reaches the state that animation was heading for."""
         if s._grp is not None:                          # a stale group used to fire hide() after a quick re-open -> window vanished / clicks lost
+            pending = s._grp_done
             try: s._grp.finished.disconnect()
             except Exception: pass
             s._grp.stop(); s._grp.deleteLater()
+            if done is None: done = pending              # keep the interrupted animation's ending, e.g. the panel reveal
         g = QParallelAnimationGroup(s)
         a = QPropertyAnimation(s, b"geometry"); a.setDuration(ms); a.setEndValue(rect)
-        a.setEasingCurve(QEasingCurve.Type.OutCubic); g.addAnimation(a)
+        a.setEasingCurve(curve or QEasingCurve.Type.OutCubic); g.addAnimation(a)
         if opacity is not None:
-            o = QPropertyAnimation(s, b"windowOpacity"); o.setDuration(ms); o.setEndValue(opacity); g.addAnimation(o)
+            o = QPropertyAnimation(s, b"windowOpacity"); o.setDuration(fade_ms or ms); o.setEndValue(opacity)
+            o.setEasingCurve(QEasingCurve.Type.OutCubic if opacity >= s.windowOpacity() else QEasingCurve.Type.InCubic)
+            g.addAnimation(o)
         if done: g.finished.connect(done)
-        s._grp = g; g.start()
+        g.finished.connect(lambda: s._group_done(g))
+        s._grp = g; s._grp_done = done; g.start()
+
+    def _group_done(s, g):
+        """Forget a group once it has finished, so a later run() cannot inherit a stale completion."""
+        if s._grp is g: s._grp = None; s._grp_done = None
 
     def is_open(s): return s.isVisible() and not s._closing and s.windowOpacity() > 0.5
 
@@ -3206,6 +3402,9 @@ class Overlay(QWidget):
         s.close_board()
         start_full = s._seen_full                                  # once opened, later opens/closes never fall back to the orb
         s._collapsed = not start_full; s._leave_at = 0.0; s._dragging = False; s._expand_t = time.time(); s._seen_inside = False
+        s._think_from_open = False; s._think_collapsed = False
+        s._min_for(not start_full)
+        s._ghost = False
         if start_full:
             s.outer.setContentsMargins(16, 16, 16, 16)
             s.collapsed.hide(); s._panel.show()
@@ -3213,26 +3412,29 @@ class Overlay(QWidget):
             s.show(); s.raise_()
             s.run(s.target(s.want_h()), 1.0)
         else:
-            s.outer.setContentsMargins(8, 8, 8, 8)
-            s._panel.hide(); s.collapsed.show()
+            s.outer.setContentsMargins(0, 0, 0, 0)
+            s._panel.hide(); s.collapsed.show(); s._min_for(True)
             place_on(s, s.scr); s.setGeometry(s.orb_rect()); s.setWindowOpacity(0)
             s.show(); s.raise_()                                # the orb must not steal focus from the app underneath
-            s.run(s.orb_rect(), 1.0)
-            if s.orb_hit(QCursor.pos()): QTimer.singleShot(180, s.expand)
+            s.run(s.orb_rect(), 1.0, None, 260, QEasingCurve.Type.OutCubic, fade_ms=200)
+            if s.cfg.get("orb_hover_expand", True) and s.orb_hit(QCursor.pos()): QTimer.singleShot(180, s.expand)
         if listen is None: listen = s.cfg.get("listen_mode", "manual") == "auto"      # default: the mic only turns on when YOU tap it
         if listen: s.start_listening()
         else: s.set_state("idle", "Ready - tap 🎤 or type")
 
     def close_overlay(s):
-        QToolTip.hideText(); s.req += 1; s.speaker.stop(); s.stop_ev.set(); s.ai_cursor_hide(); s.close_board(); s.hide_pill(); s._think_collapsed = False
+        QToolTip.hideText(); s.req += 1; s.speaker.stop(); s.stop_ev.set(); s.ai_cursor_hide(); s.close_board(); s.hide_pill()
+        s._think_collapsed = False; s._think_from_open = False; s._ghost = False
         if s.rec.stream: s.rec.stop()
         s._stealth = False; s.state = "idle"; s.orb.mode = "idle"; s._closing = True
         s._collapsed = False; s._leave_at = 0.0
-        end = QRect(s.geometry()); end.translate(0, 40); s.run(end, 0.0, s._finish_close, 220)
+        s._min_for(False)
+        end = QRect(s.orb_rect()); end.adjust(4, 4, -4, -4)       # the chat folds back into the orb
+        s.run(end, 0.0, s._finish_close, 240, QEasingCurve.Type.InOutCubic, fade_ms=210)
 
     def _finish_close(s):
         if s._closing:
-            s.hide_pill(); s.hide(); s.timer.stop(); QToolTip.hideText()
+            s.hide_pill(); s.hide(); s.timer.stop(); QToolTip.hideText(); s._ghost = False
             s.collapsed.hide(); s._panel.show(); s.outer.setContentsMargins(16, 16, 16, 16)
 
     def keyPressEvent(s, e):
@@ -3292,13 +3494,16 @@ class Overlay(QWidget):
         s.state = st; s.orb.mode = st; s.big.mode = st; s.status.setText(text)
         s.b_mic.setStyleSheet("background:#c62839;color:#fff" if st == "listening" else "")           # red mic = the microphone is ON
         if st == "thinking" and s.isVisible() and not s._closing and s.board is None:
-            if not s._collapsed: s.collapse(force=True); s._think_collapsed = True                    # thinking morphs to the orb + pill
+            s._think_from_open = s._think_from_open or not s._collapsed                          # remember where it came from
+            if not s._collapsed: s.collapse(force=True)                                           # thinking morphs to the orb + pill
+            s._think_collapsed = True
             s.show_pill(text)
         else:
             s.hide_pill()
-            if prev == "thinking" and s._think_collapsed:                                             # thinking is over: back to the full overlay
-                s._think_collapsed = False
-                if s._collapsed and s.board is None and s.kind not in BOARD_KINDS and s.isVisible() and not s._closing: s.expand()
+            if prev == "thinking" and s._think_collapsed:                                          # thinking is over: back to the full overlay
+                s._think_collapsed = False; restore, s._think_from_open = s._think_from_open, False
+                if (restore and s._collapsed and s.board is None and s.kind not in BOARD_KINDS
+                        and s.isVisible() and not s._closing): s.expand()
 
     def start_listening(s):
         s.speaker.stop()                                           # barge-in + don't record our own voice
@@ -3529,11 +3734,35 @@ class Overlay(QWidget):
         for n in s.notices:
             if n.id == nid and getattr(n, "_card", None) is not None: n._card.set_result(ok, err)
 
-    def paintEvent(s, e):                         # soft shadow around the panel (cheap, no graphics effect)
-        if s._panel.isHidden(): return            # collapsed: only the orb is on screen
-        p = QPainter(s); p.setRenderHint(QPainter.RenderHint.Antialiasing); p.setPen(Qt.PenStyle.NoPen); r = QRectF(s._panel.geometry())
+    def paintEvent(s, e):                         # soft shadow + accent glow around the panel (cheap, no graphics effect)
+        ghost = s._ghost
+        if s._panel.isHidden() and not ghost: return   # collapsed: only the orb is on screen
+        p = QPainter(s); p.setRenderHint(QPainter.RenderHint.Antialiasing); p.setPen(Qt.PenStyle.NoPen)
+        if ghost:
+            mg = s.outer.contentsMargins(); r = QRectF(s.rect()).adjusted(mg.left(), mg.top(), -mg.right(), -mg.bottom())
+        else:
+            r = QRectF(s._panel.geometry())
+        accent = chat_color(s.cfg); surf = panel_surface(accent); rad = surf["radius"]
+        for i in range(6, 0, -1):                 # a faint accent halo, so the panel reads as the orb's light
+            c = QColor(accent); c.setAlpha(int(20 * (1 - (i - 1) / 6) ** 2))
+            p.setBrush(c); p.drawRoundedRect(r.adjusted(-i, -i, i, i), rad + i, rad + i)
         for i in range(10):
-            p.setBrush(QColor(0, 0, 0, int(34 * (1 - i / 10) ** 2))); p.drawRoundedRect(r.adjusted(-i, -i + 4, i, i + 4), 24 + i, 24 + i)
+            p.setBrush(QColor(0, 0, 0, int(34 * (1 - i / 10) ** 2))); p.drawRoundedRect(r.adjusted(-i, -i + 4, i, i + 4), rad + i, rad + i)
+        if s._bloom > 0:                          # light spilling out of the orb while the chat unfolds
+            o = s.orb_rect().center(); c = QPointF(s.mapFromGlobal(o)); rad = 60 + 340 * s._bloom
+            c.setX(max(6.0, min(c.x(), s.width() - 6.0))); c.setY(max(6.0, min(c.y(), s.height() - 6.0)))
+            g = QRadialGradient(c, rad)
+            hot = QColor(accent.lighter(150)); hot.setAlpha(int(120 * (1 - s._bloom) ** 1.6))
+            mid = QColor(accent); mid.setAlpha(int(60 * (1 - s._bloom) ** 1.6))
+            g.setColorAt(0, hot); g.setColorAt(.55, mid); g.setColorAt(1, QColor(accent.red(), accent.green(), accent.blue(), 0))
+            p.setBrush(g); p.drawEllipse(c, rad, rad)
+        if ghost:                                 # exactly the surface #panel is styled with, scaled from orb to panel
+            fill = QLinearGradient(r.topLeft(), r.bottomLeft())
+            fill.setColorAt(0, surf["top"]); fill.setColorAt(1, surf["bot"])
+            rad2 = min(float(rad), r.height() / 2, r.width() / 2)
+            p.setBrush(fill); p.setPen(Qt.PenStyle.NoPen); p.drawRoundedRect(r, rad2, rad2)
+            p.setBrush(Qt.BrushStyle.NoBrush); p.setPen(QPen(surf["edge"], 1))
+            p.drawRoundedRect(r, rad2, rad2)
 
     # --- asking ---
     def submit_text(s):
@@ -4555,63 +4784,125 @@ class Settings(QDialog):
         s.opos = QComboBox()
         for key, label in ORB_PLACES: s.opos.addItem(label, key)
         s.ox = QSpinBox(); s.oy = QSpinBox()
-        for sp in (s.ox, s.oy): sp.setRange(0, 20000); sp.setSingleStep(10); sp.setSuffix(" px")
+        for sp in (s.ox, s.oy): sp.setRange(-100000, 100000); sp.setSingleStep(10); sp.setSuffix(" px")
         crow = QHBoxLayout(); crow.setSpacing(8)
         for lbl, sp in (("X", s.ox), ("Y", s.oy)):
             q = QLabel(lbl); q.setObjectName("hint"); crow.addWidget(q); crow.addWidget(sp)
         crow.addStretch(); f1.addRow("Orb position", s.opos); f1.addRow("Custom coordinates", crow)
+        use_now = QPushButton("Use the orb's current spot"); use_now.clicked.connect(s._orb_use_now)
+        row = QHBoxLayout(); row.addWidget(use_now); row.addStretch(); f1.addRow("", row)
         s.opos.currentIndexChanged.connect(s._orb_changed)
         for sp in (s.ox, s.oy): sp.valueChanged.connect(s._orb_changed)
-        v1.addWidget(hint_label("Changes here apply immediately and are saved right away."))
+        v1.addWidget(hint_label("Changes here apply immediately and are saved right away. A custom spot is always kept "
+                                "on a connected monitor, so the orb can never end up off-screen."))
 
-        c2, f2, v2 = mk_card("Colour", "The accent tints the orb's sphere, glow, halo, thinking pill and speaking waves.")
-        s.ocolor = QComboBox()
-        for hexv, label in ORB_COLORS: s.ocolor.addItem(label, hexv)
+        c2, f2, v2 = mk_card("Colour", "Pick one accent for everything, or give the orb and the opened chat their own colours. "
+                                         "The accent tints the orb's sphere, glow and waves, and the chat's panel edge, focus ring, buttons and highlights.")
+        s.orb_shared = Switch("Use one colour theme for the Orb and the Chat")
+        s.orb_shared.toggled.connect(s._orb_changed); f2.addRow("", s.orb_shared)
+        s.ocolor = QComboBox(); s.ccolor = QComboBox()
+        for hexv, label in ORB_COLORS:
+            s.ocolor.addItem(label, hexv); s.ccolor.addItem(label, hexv)
         s.swatch = QLabel(); s.swatch.setFixedSize(30, 24)
-        s.ocolor_btn = QPushButton("Custom colour…")
-        s.ocolor_btn.clicked.connect(s._pick_orb_color); s.ocolor.currentIndexChanged.connect(s._orb_preset)
+        s.cswatch = QLabel(); s.cswatch.setFixedSize(30, 24)
+        s.ocolor_btn = QPushButton("Custom colour…"); s.ccolor_btn = QPushButton("Custom colour…")
+        s.ocolor_btn.clicked.connect(s._pick_orb_color); s.ccolor_btn.clicked.connect(s._pick_chat_color)
+        s.ocolor.currentIndexChanged.connect(s._orb_preset); s.ccolor.currentIndexChanged.connect(s._chat_preset)
         ccol = QHBoxLayout(); ccol.setSpacing(8); ccol.addWidget(s.swatch); ccol.addWidget(s.ocolor, 1); ccol.addWidget(s.ocolor_btn)
-        f2.addRow("Accent colour", ccol)
+        qcol = QHBoxLayout(); qcol.setSpacing(8); qcol.addWidget(s.cswatch); qcol.addWidget(s.ccolor, 1); qcol.addWidget(s.ccolor_btn)
+        f2.addRow("Orb colour", ccol); f2.addRow("Chat colour", qcol)
 
-        c3, f3, v3 = mk_card("Size", "Small, Medium or Large - the orb and its window scale together, and the controls grow out of the same spot.")
+        c3, f3, v3 = mk_card("Size", "Small, Medium or Large - the orb, its glow and the spot the chat grows out of all scale together.")
         s.osize = QComboBox()
         for key, label, _f in ORB_SIZES: s.osize.addItem(label, key)
         f3.addRow("Orb size", s.osize); s.osize.currentIndexChanged.connect(s._orb_changed)
+        rb = QPushButton("Reset the Orb to defaults"); rb.clicked.connect(s._orb_reset)
+        rrow = QHBoxLayout(); rrow.addWidget(rb); rrow.addStretch(); v3.addLayout(rrow)
         v3.addWidget(hint_label("Tip: a Large orb is easier to hover on a 4K or TV screen; Small keeps it out of the way."))
         return mk_page("Orb", c1, c2, c3)
 
     def _orb_coords_state(s):
+        """The X / Y boxes only mean something for a custom spot; the rest of the time they mirror the live orb."""
         custom = s.opos.currentData() == "custom"
         s.ox.setEnabled(custom); s.oy.setEnabled(custom)
+        shared = s.orb_shared.isChecked()
+        for w in (s.ccolor, s.ccolor_btn): w.setEnabled(not shared)
+        s.cswatch.setEnabled(not shared)
 
     def _paint_swatch(s):
-        c = QColor(s._orb_hex)
-        s.swatch.setStyleSheet(f"background:{s._orb_hex};border:1px solid rgba(255,255,255,60);border-radius:7px")
-        s.swatch.setToolTip(c.name() if c.isValid() else s._orb_hex)
+        for lbl, hexv, tip in ((s.swatch, getattr(s, "_orb_hex", "#6c8cf5"), "Orb colour"),
+                               (s.cswatch, getattr(s, "_chat_hex", "#6c8cf5"), "Chat colour")):
+            c = QColor(hexv)
+            lbl.setStyleSheet(f"background:{hexv};border:1px solid rgba(255,255,255,60);border-radius:7px")
+            lbl.setToolTip(f"{tip}: {c.name() if c.isValid() else hexv}")
 
     def _orb_preset(s):
         hexv = s.ocolor.currentData()
         if hexv: s._orb_hex = hexv; s._paint_swatch(); s._orb_changed()
 
-    def _pick_orb_color(s):
-        c = QColorDialog.getColor(QColor(s._orb_hex), s, "Orb colour")
+    def _chat_preset(s):
+        hexv = s.ccolor.currentData()
+        if hexv: s._chat_hex = hexv; s._paint_swatch(); s._orb_changed()
+
+    def _pick_color(s, key, title):
+        c = QColorDialog.getColor(QColor(getattr(s, key, "#6c8cf5")), s, title)
         if not c.isValid(): return
-        s._orb_hex = c.name(); s.ocolor.blockSignals(True); s.ocolor.setCurrentIndex(-1); s.ocolor.blockSignals(False)
+        setattr(s, key, c.name())
+        combo = s.ocolor if key == "_orb_hex" else s.ccolor
+        combo.blockSignals(True); combo.setCurrentIndex(combo.findData(c.name())); combo.blockSignals(False)
+        s._paint_swatch(); s._orb_changed()
+
+    def _pick_orb_color(s): s._pick_color("_orb_hex", "Orb colour")
+
+    def _pick_chat_color(s): s._pick_color("_chat_hex", "Chat colour")
+
+    def _orb_use_now(s):
+        """Adopt the orb's current on-screen position as the custom spot."""
+        ov = getattr(s.app, "ov", None)
+        r = ov.orb_rect() if ov is not None else None
+        if r is None: return
+        s._orb_loading = True
+        s.ox.setValue(r.x()); s.oy.setValue(r.y())
+        s.opos.setCurrentIndex(max(0, s.opos.findData("custom")))
+        s._orb_loading = False
+        s._orb_changed()
+
+    def _orb_reset(s):
+        s._orb_loading = True
+        s.opos.setCurrentIndex(max(0, s.opos.findData(DEFAULTS["orb_position"])))
+        s.osize.setCurrentIndex(max(0, s.osize.findData(DEFAULTS["orb_size"])))
+        s.orb_shared.setChecked(DEFAULTS["orb_theme_shared"])
+        s._orb_hex = DEFAULTS["orb_color"]; s._chat_hex = DEFAULTS["chat_color"]
+        for combo, hexv in ((s.ocolor, s._orb_hex), (s.ccolor, s._chat_hex)):
+            combo.blockSignals(True); combo.setCurrentIndex(combo.findData(hexv)); combo.blockSignals(False)
+        s.ox.setValue(0); s.oy.setValue(0)
+        s._orb_loading = False
         s._paint_swatch(); s._orb_changed()
 
     def _orb_changed(s):
-        """Apply Orb placement / colour / size live (and persist), without waiting for Save."""
+        """Apply Orb placement / colour / theme / size live (and persist), without waiting for Save.
+
+        Only the setting that changed is written, the result is validated in one place (normalize_orb) and the
+        widgets are re-synced from that validated config - so the UI can never show something the orb is not doing."""
         if getattr(s, "_orb_loading", False): return
         c = s.app.cfg
         c["orb_position"] = s.opos.currentData() or "bottom-right"
-        c["orb_x"], c["orb_y"] = s.ox.value(), s.oy.value()
+        if c["orb_position"] == "custom": c["orb_x"], c["orb_y"] = s.ox.value(), s.oy.value()
         c["orb_color"] = getattr(s, "_orb_hex", c.get("orb_color", "#6c8cf5"))
+        c["chat_color"] = getattr(s, "_chat_hex", c.get("chat_color", "#6c8cf5"))
+        c["orb_theme_shared"] = s.orb_shared.isChecked()
         c["orb_size"] = s.osize.currentData() or "medium"
+        normalize_orb(c)
         try: save_cfg(c)
         except Exception: pass
         ov = getattr(s.app, "ov", None)
-        if ov is not None: ov.apply_orb_style()
-        s._orb_coords_state()
+        if ov is not None:
+            ov.apply_orb_style()
+            r = ov.orb_rect()
+            s._orb_loading = True
+            s.ox.setValue(r.x()); s.oy.setValue(r.y())        # show where the orb really is
+            s._orb_loading = False
+        s._paint_swatch(); s._orb_coords_state()
 
     def _memory(s):
         c, f, v = mk_card("Long-term memory"); s.memory_panel = MemoryPanel(s.app.memory); v.addWidget(s.memory_panel)
@@ -4700,11 +4991,13 @@ class Settings(QDialog):
         s._snap = {k: c.get(k) for k in s.VOICE_KEYS}; s._saved = False; s.refresh_voices(); s.vault_status()
         s.refresh_displays(c.get("display", "cursor")); s.memory_panel.refresh(); s.load_conns(); s.status.setText("")
         s._orb_loading = True
+        normalize_orb(c)
         s.opos.setCurrentIndex(max(0, s.opos.findData(c.get("orb_position", "bottom-right"))))
-        s.ox.setValue(max(0, int(c.get("orb_x", 0) or 0))); s.oy.setValue(max(0, int(c.get("orb_y", 0) or 0)))
-        s._orb_hex = str(c.get("orb_color", "") or "#6c8cf5")
-        if not QColor(s._orb_hex).isValid(): s._orb_hex = "#6c8cf5"
-        icol = s.ocolor.findData(s._orb_hex); s.ocolor.blockSignals(True); s.ocolor.setCurrentIndex(icol); s.ocolor.blockSignals(False)
+        s.ox.setValue(_as_int(c.get("orb_x", 0), 0)); s.oy.setValue(_as_int(c.get("orb_y", 0), 0))
+        s._orb_hex = c["orb_color"]; s._chat_hex = c["chat_color"]
+        s.orb_shared.setChecked(_as_bool(c.get("orb_theme_shared"), True))
+        for combo, hexv in ((s.ocolor, s._orb_hex), (s.ccolor, s._chat_hex)):
+            combo.blockSignals(True); combo.setCurrentIndex(combo.findData(hexv)); combo.blockSignals(False)
         s._paint_swatch()
         s.osize.setCurrentIndex(max(0, s.osize.findData(c.get("orb_size", "medium"))))
         s.board_speak.setChecked(bool(c.get("board_speak", True)))
@@ -4824,10 +5117,14 @@ class Settings(QDialog):
                          muted=not s.speak_on.isChecked(), speak_notices=s.spk_notices.isChecked(), voice_style=s.vstyle.currentData(), voice_persona=s.persona.currentData(),
                          voice_rate=s.vrate.value(), voice_name=s.vname.currentData() or "", listen_mode=s.listen.currentData(), vault_ai=s.vault_ai.isChecked(),
                          vault_session_min=s.vsess.currentData(), orb_position=s.opos.currentData() or "bottom-right",
-                         orb_x=s.ox.value(), orb_y=s.oy.value(), orb_color=getattr(s, "_orb_hex", "#6c8cf5"),
+                         orb_x=(s.ox.value() if s.opos.currentData() == "custom" else s.app.cfg.get("orb_x", -1)),
+                         orb_y=(s.oy.value() if s.opos.currentData() == "custom" else s.app.cfg.get("orb_y", -1)),
+                         orb_color=getattr(s, "_orb_hex", "#6c8cf5"),
+                         chat_color=getattr(s, "_chat_hex", "#6c8cf5"), orb_theme_shared=s.orb_shared.isChecked(),
                          orb_size=s.osize.currentData() or "medium", board_speak=s.board_speak.isChecked(), **combos)
         s.app.vault.session_min = int(s.vsess.currentData())
         if s.app.vault.session_min == 0: s.app.vault.lock_now()
+        normalize_orb(s.app.cfg)
         s._saved = True; s.app.ov.b_snd.blockSignals(True); s.app.ov.b_snd.setChecked(s.speak_on.isChecked()); s.app.ov.b_snd.blockSignals(False)
         try: save_cfg(s.app.cfg)
         except Exception as ex: QMessageBox.warning(s, "Settings", f"Couldn't write config.json: {ex}"); return
