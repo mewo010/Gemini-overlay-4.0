@@ -24,7 +24,7 @@ Run: python ai_overlay.py   (rename to .pyw to hide the console)
 Emergency stop for any automation: Ctrl+Alt+X (rebindable) or fling the mouse into a screen corner.
 
 The program is split into the ai_overlay_lib package (core, accounts, system, voice, widgets, connectors,
-panel, chat, dialogs, app). This file stays the entry point and keeps the original flat import surface:
+panel, orb_animation, chat_animation, chat, dialogs, app). This file stays the entry point and keeps the original flat import surface:
 `import ai_overlay` still exposes every class and helper it used to.
 """
 
@@ -32,7 +32,9 @@ from ai_overlay_lib.core import *          # noqa: F401,F403  (one flat namespac
 from ai_overlay_lib.accounts import *      # noqa: F401,F403
 from ai_overlay_lib.system import *        # noqa: F401,F403
 from ai_overlay_lib.voice import *         # noqa: F401,F403
-from ai_overlay_lib.widgets import *       # noqa: F401,F403
+from ai_overlay_lib.orb_animation import *  # noqa: F401,F403
+from ai_overlay_lib.chat_animation import * # noqa: F401,F403
+from ai_overlay_lib.widgets import *        # noqa: F401,F403
 from ai_overlay_lib.connectors import *    # noqa: F401,F403
 from ai_overlay_lib.panel import *         # noqa: F401,F403
 from ai_overlay_lib.chat import *          # noqa: F401,F403

@@ -4,7 +4,7 @@ from .accounts import *
 from .system import *
 from .voice import *
 from .connectors import *
-from .widgets import AIOrb
+from .orb_animation import AIOrb
 from PyQt6.QtWidgets import QSlider
 
 # ---------- settings / data dialogs ----------

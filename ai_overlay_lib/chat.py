@@ -6,7 +6,10 @@ from .voice import *
 from .widgets import *
 from .connectors import *
 from .panel import *
-from .ai import provider_chain, build_body, stream_chat, AIError, trim_history
+from .orb_animation import should_hover_expand
+from .chat_animation import *
+from .ai import (provider_chain, build_body, stream_chat, AIError, trim_history, gemini_model,
+                 TOTAL_TIMEOUT, MAX_ATTEMPTS)
 
 # ---------- main overlay ----------
 CONTROL = {"click", "move", "drag", "scroll", "type", "key", "wait"}
@@ -118,7 +121,9 @@ class Overlay(QWidget):
         cbox.addWidget(s.big, 0, Qt.AlignmentFlag.AlignCenter); s.collapsed.hide(); outer.addWidget(s.collapsed)
         s.big.clicked.connect(lambda: s.expand(activate=True)); s.big.move_by.connect(s.orb_moved); s.big.released.connect(s.orb_dropped)
         s.pill = None; s._last_grow = 0.0; s._think_collapsed = False
-        s.watch = QTimer(s); s.watch.timeout.connect(s.watch_cursor); s.watch.start(120)    # hover the orb -> open (no auto-collapse)
+        s.watch = QTimer(s); s.watch.timeout.connect(s.watch_cursor)    # hover the orb -> open; only runs while visible
+        s._watchdog = QTimer(s); s._watchdog.setSingleShot(True); s._watchdog.timeout.connect(s._request_timed_out)
+        s._watchdog_rid = 0                                             # a request can never sit in 'thinking' forever
         QApplication.instance().installEventFilter(s)                                      # double-click the open overlay to close it
 
     # --- geometry / animation ---
@@ -241,41 +246,11 @@ class Overlay(QWidget):
     def _set_bloom(s, v):
         s._bloom = max(0.0, min(1.0, v)); s.update()
 
-    @staticmethod
-    def _ease_out_quint(t): return 1.0 - (1.0 - t) ** 5
-
-    @staticmethod
-    def _ease_in_out(t): return t * t * (3.0 - 2.0 * t)
-
     def _morph_frame(s, p, a, b, outward):
-        """One frame of the unfold: the surface grows from the orb's corner, then glides into place.
-
-        Outward: width grows a little behind height (so it reads as unfolding), the growing surface stays
-        anchored to the orb's nearest corner, and the last two thirds of the time slide it to its final spot.
-        Inward: the same rectangle collapses smoothly back into the orb.
-        """
-        p = max(0.0, min(1.0, float(p)))
-        if outward:
-            grow = s._ease_in_out(min(1.0, p / 0.72))        # unfold first ...
-            glide = s._ease_in_out(max(0.0, min(1.0, (p - 0.40) / 0.60)))   # ... then glide sideways
-            w = a.width() + (b.width() - a.width()) * (0.34 * grow + 0.66 * grow * grow)
-            h = a.height() + (b.height() - a.height()) * grow
-            ax = a.right() - w + 1 if b.center().x() < a.center().x() else float(a.left())
-            ay = a.bottom() - h + 1 if b.center().y() < a.center().y() else float(a.top())
-            x = ax + (b.x() - ax) * glide
-            y = ay + (b.y() - ay) * glide
-            s._ghost_inset = 16 * min(1.0, p / 0.45)
-            s._unfold_rad = a.width() / 2 + (PANEL_RADIUS - a.width() / 2) * s._ease_out_quint(min(1.0, p / 0.75))
-        else:
-            e = s._ease_in_out(p)
-            w = a.width() + (b.width() - a.width()) * e
-            h = a.height() + (b.height() - a.height()) * e
-            x = a.x() + (b.x() - a.x()) * e
-            y = a.y() + (b.y() - a.y()) * e
-            s._ghost_inset = 16 * max(0.0, 1.0 - p / 0.55)
-            s._unfold_rad = a.width() / 2 + (b.width() / 2 - a.width() / 2) * e
-        s._unfold_p = p
-        s.setGeometry(QRect(int(round(x)), int(round(y)), max(1, int(round(w))), max(1, int(round(h)))))
+        """One frame of the unfold, computed by the dedicated chat animation module."""
+        f = compute_morph(p, a, b, outward)
+        s._unfold_p, s._unfold_rad, s._ghost_inset = f.p, f.radius, f.inset
+        s.setGeometry(f.rect())
         s.update()
 
     def morph(s, to, done=None, ms=460, outward=True):
@@ -380,9 +355,10 @@ class Overlay(QWidget):
 
     def watch_cursor(s):
         """Hover the orb -> open the full overlay. It then stays open until it is closed or the AI starts thinking."""
-        if not s.isVisible() or s._closing or s._dragging or not s._collapsed: return
-        if s.settings_open(): return          # changing Orb settings must never look like a hover
-        if s.cfg.get("orb_hover_expand", True) and s.orb_hit(QCursor.pos()): s.expand()
+        if should_hover_expand(visible=s.isVisible(), collapsed=s._collapsed, closing=s._closing,
+                               dragging=s._dragging, settings_open=s.settings_open(),
+                               enabled=s.cfg.get("orb_hover_expand", True), over_orb=s.orb_hit(QCursor.pos())):
+            s.expand()
 
     def orb_moved(s, dx, dy):
         s._dragging = True
@@ -432,8 +408,10 @@ class Overlay(QWidget):
         s._grp = g; s._grp_done = done; g.start()
 
     def _group_done(s, g):
-        """Forget a group once it has finished, so a later run() cannot inherit a stale completion."""
-        if s._grp is g: s._grp = None; s._grp_done = None
+        """Forget a finished group and release it, so a later run() cannot inherit a stale completion."""
+        if s._grp is g:
+            s._grp = None; s._grp_done = None
+            g.deleteLater()
 
     def is_open(s): return s.isVisible() and not s._closing and s.windowOpacity() > 0.5
 
@@ -452,6 +430,7 @@ class Overlay(QWidget):
         s.b_scr.blockSignals(True); s.b_scr.setChecked(False); s.b_scr.blockSignals(False)
         s.set_region(None); s.out.hide(); s.out.clear(); s.srcl.hide(); s.edit.clear()
         if not s.timer.isActive(): s.timer.start(33)
+        if not s.watch.isActive(): s.watch.start(120)
         prov = s.speaker.provider()
         warm([p["url"] for p in s.cfg["providers"]] + ([s.cfg["tts_url"]] if prov == "openai" else ["https://api.elevenlabs.io"] if prov == "elevenlabs" else []))
         s.close_board()
@@ -478,7 +457,7 @@ class Overlay(QWidget):
         else: s.set_state("idle", "Ready - tap 🎤 or type")
 
     def close_overlay(s):
-        s._render_timer.stop(); s._stream_dirty = False
+        s._render_timer.stop(); s._stream_dirty = False; s._watchdog.stop()
         QToolTip.hideText(); s.req += 1; s.speaker.stop(); s.stop_ev.set(); s.ai_cursor_hide(); s.close_board(); s.hide_pill()
         s._think_collapsed = False; s._think_from_open = False; s._ghost = False
         if s.rec.stream: s.rec.stop()
@@ -491,6 +470,7 @@ class Overlay(QWidget):
 
     def _finish_close(s):
         if s._closing:
+            s.watch.stop(); s._watchdog.stop()
             s.hide_pill(); s.hide(); s.timer.stop(); QToolTip.hideText(); s._ghost = False
             s._unfold_p = 1.0; s._ghost_inset = 16
             s.collapsed.hide(); s._panel.show(); s.outer.setContentsMargins(16, 16, 16, 16)
@@ -805,35 +785,12 @@ class Overlay(QWidget):
             r = QRectF(s._panel.geometry())
         accent = chat_color(s.cfg); surf = panel_surface(accent)
         rad = max(2.0, float(s._unfold_rad)) if ghost else surf["radius"]
-        for i in range(6, 0, -1):                 # a faint accent halo, so the panel reads as the orb's light
-            c = QColor(accent); c.setAlpha(int(20 * (1 - (i - 1) / 6) ** 2))
-            p.setBrush(c); p.drawRoundedRect(r.adjusted(-i, -i, i, i), rad + i, rad + i)
-        for i in range(10):
-            p.setBrush(QColor(0, 0, 0, int(34 * (1 - i / 10) ** 2))); p.drawRoundedRect(r.adjusted(-i, -i + 4, i, i + 4), rad + i, rad + i)
-        if s._bloom > 0:                          # light spilling out of the orb while the chat unfolds
-            o = s.orb_rect().center(); c = QPointF(s.mapFromGlobal(o)); rad = 60 + 340 * s._bloom
-            c.setX(max(6.0, min(c.x(), s.width() - 6.0))); c.setY(max(6.0, min(c.y(), s.height() - 6.0)))
-            g = QRadialGradient(c, rad)
-            hot = QColor(accent.lighter(150)); hot.setAlpha(int(120 * (1 - s._bloom) ** 1.6))
-            mid = QColor(accent); mid.setAlpha(int(60 * (1 - s._bloom) ** 1.6))
-            g.setColorAt(0, hot); g.setColorAt(.55, mid); g.setColorAt(1, QColor(accent.red(), accent.green(), accent.blue(), 0))
-            p.setBrush(g); p.drawEllipse(c, rad, rad)
-        if ghost and s._unfold_dir > 0 and s._unfold_p < 0.42:
-            # the orb's own light lingers for a moment where the surface emerges
-            k = max(0.0, 1.0 - s._unfold_p / 0.42)
-            oc = QPointF(s.mapFromGlobal(s.orb_rect().center()))
-            aur = QRadialGradient(oc, max(24.0, s.width() * 0.34))
-            aur.setColorAt(0, _rgba(aura_color(s.cfg), 105 * k))
-            aur.setColorAt(0.55, _rgba(aura_color(s.cfg), 34 * k))
-            aur.setColorAt(1, _rgba(aura_color(s.cfg), 0))
-            p.setBrush(aur); p.setPen(Qt.PenStyle.NoPen); p.drawEllipse(oc, max(24.0, s.width() * 0.34), max(24.0, s.width() * 0.34))
-        if ghost:                                 # exactly the surface #panel is styled with, scaled from orb to panel
-            fill = QLinearGradient(r.topLeft(), r.bottomLeft())
-            fill.setColorAt(0, surf["top"]); fill.setColorAt(1, surf["bot"])
-            rad2 = min(float(rad), r.height() / 2, r.width() / 2)
-            p.setBrush(fill); p.setPen(Qt.PenStyle.NoPen); p.drawRoundedRect(r, rad2, rad2)
-            p.setBrush(Qt.BrushStyle.NoBrush); p.setPen(QPen(surf["edge"], 1))
-            p.drawRoundedRect(r, rad2, rad2)
+        paint_panel_frame(p, r, rad, accent)
+        paint_bloom(p, s.mapFromGlobal(s.orb_rect().center()), s.size(), accent, s._bloom)
+        if ghost and s._unfold_dir > 0 and s._unfold_p < REMNANT_END:
+            paint_orb_remnant(p, s.mapFromGlobal(s.orb_rect().center()), s.width(), aura_color(s.cfg),
+                              max(0.0, 1.0 - s._unfold_p / REMNANT_END))
+        if ghost: paint_ghost_surface(p, r, rad, surf)
 
     # --- asking ---
     def submit_text(s):
@@ -857,22 +814,25 @@ class Overlay(QWidget):
         return provider_chain(s.cfg["providers"], s.cool, s.usage)
 
     def system_prompt(s, kind, screen, img):
+        """`img` may be a (width, height) tuple: the screenshot only needs encoding in the worker thread."""
         sp = SYSTEM_BASE
         persona = PERSONAS.get(s.cfg.get("voice_persona", "default"), PERSONAS["default"])[1]
         if persona: sp += " Personality: " + persona + " Keep it light and short; it changes only your wording, never accuracy, action blocks, or what you report about results."
         if kind in BOARD_KINDS: sp += BOARD_DOC
         else:
             sp += "\n\n" + ACTIONS_DOC
-            sp += "\n\nMonitors (physical px):\n" + monitor_text(s._sc if screen else None)
+            if s.b_scr.isChecked() or screen:
+                sp += "\n\nMonitors (physical px):\n" + monitor_text(s._sc if screen else None)   # only needed for screen actions
             sp += "\nWhen the user does not name a music service, use: " + str(s.cfg.get("music_service", "spotify")) + "."
             if screen and img is not None:
-                sp += (f"\n\nScreen control: ON. The attached screenshot is {img.width()}x{img.height()} px with a labelled red coordinate grid; "
+                iw, ih = img if isinstance(img, tuple) else (img.width(), img.height())
+                sp += (f"\n\nScreen control: ON. The attached screenshot is {iw}x{ih} px with a labelled red coordinate grid; "
                        "all x,y values use that pixel space. Aim for the centre of the target.")
             elif s.b_scr.isChecked():       # the real toggle, not whether this particular message carries a screenshot
                 sp += "\n\nScreen control: ON, but no screenshot is attached to this message. Use observe {} when you need to see the screen."
             else:
                 sp += "\n\nScreen control: OFF - click/move/drag/scroll/type/key/observe are unavailable. If the user wants the screen controlled, tell them to switch on the 'Screen control' button."
-        mem = s.memory.prompt()
+        mem = s.memory.prompt(1800)                 # newest facts within a smaller budget: less prompt on every turn
         if mem: sp += "\n\nLong-term memory about the user (persists across sessions):\n" + mem
         return sp + "\n\nCurrent date/time: " + time.strftime("%A %d %B %Y, %H:%M")
 
@@ -882,22 +842,48 @@ class Overlay(QWidget):
         s._last_auto = auto; s.req += 1; rid = s.req; provs = s.providers()
         if not provs:
             s.set_state("idle", "No provider"); s.partial.emit(rid, "⚠️ Add a provider + API key in ⚙ Settings → Providers."); return
-        img = prep_image(pix, grid=screen) if pix is not None else None
+        # Copy the pixmap once on the GUI thread, then scale/grid/encode in the worker: a 4K screenshot
+        # used to block the UI while it was smoothly resized and base64-encoded.
+        img = (pix.toImage() if hasattr(pix, "toImage") else pix) if pix is not None else None
+        img_size = None
+        if img is not None:
+            iw = min(img.width(), 1280); ih = max(1, round(img.height() * iw / max(1, img.width())))
+            img_size = (iw, ih)
         s.meta = None; s._map = None
         if screen and pix is not None and s._sc is not None:        # map screenshot px -> real screen px for clicks
             px, py, pw, ph = phys_rect(s._sc)             # physical origin of THIS monitor (correct with mixed DPI / negative offsets)
-            s.meta = {"ox": px, "oy": py, "k": pw / img.width(), "w": pw, "h": ph}
+            s.meta = {"ox": px, "oy": py, "k": pw / img_size[0], "w": pw, "h": ph}
             s._map = {"mode": "screen", "sc": s._sc, **s.meta}
         elif img is not None and getattr(s, "region_rect", None) is not None:
-            s._map = {"mode": "region", "rect": QRect(s.region_rect), "iw": max(1, img.width()), "ih": max(1, img.height())}
+            s._map = {"mode": "region", "rect": QRect(s.region_rect), "iw": max(1, img_size[0]), "ih": max(1, img_size[1])}
         note = text or "(spoken question)"
         if img is not None: note += " [screen attached]"
         s.pending = {"role": "user", "content": note}; s.reply = ""; s.kind = kind
-        req = dict(text=text, audio=audio, img=img, kind=kind, history=trim_history(s.messages), system=s.system_prompt(kind, screen, img))
+        req = dict(text=text, audio=audio, img=img, kind=kind, screen=bool(screen),
+                   history=trim_history(s.messages), system=s.system_prompt(kind, screen, img_size))
         s.set_state("thinking", "Thinking…")
         threading.Thread(target=s.worker, args=(rid, req, provs), daemon=True).start()
+        s._watchdog_rid = rid; s._watchdog.start(int((TOTAL_TIMEOUT + 25) * 1000))
+
+    def _request_timed_out(s):
+        """Last line of defence: even if a worker thread dies in an unexpected way, the UI never stays stuck."""
+        if s.state != "thinking" or s._watchdog_rid != s.req: return
+        s.req += 1; s.stop_ev.set(); s._render_timer.stop(); s._stream_dirty = False
+        s.out.setMarkdown("⚠️ No complete answer arrived - the request timed out. Tap Send or the microphone to try again.")
+        s.out.show()
+        if s._collapsed: s.expand()
+        s._unstealth(); s.set_state("idle", "Request timed out - try again")
 
     def worker(s, rid, req, provs):
+        """Always finish the request, even on an unexpected error, so the overlay cannot stay on 'Waiting'."""
+        try:
+            s.worker_run(rid, req, provs)
+        except Exception as ex:
+            if rid == s.req:
+                try: s.partial.emit(rid, f"⚠️ Internal error: {str(ex)[:180]}")
+                finally: s.finished.emit(rid, False)
+
+    def worker_run(s, rid, req, provs):
         errs = []; text, audio = req["text"], req["audio"]; kind = req.get("kind", "chat")
         if audio:      # speech -> text when needed: Whisper API if configured, else Windows' built-in recognizer, else send the audio to a model that takes audio
             remote = s.cfg["stt_mode"] == "transcribe" and s.cfg["stt_key"]; native = any(p.get("audio") for p in provs)
@@ -911,7 +897,8 @@ class Overlay(QWidget):
                 except Exception as ex:
                     if not native: s.partial.emit(rid, f"⚠️ I couldn't turn your speech into text ({str(ex)[:120]}). Type your request, or add a speech-to-text key in Settings → Voice."); s.finished.emit(rid, False); return
                     errs.append(f"Speech-to-text: {ex} (sending raw audio instead)")
-        b64 = img_to_b64(req["img"]) if req["img"] is not None else None
+        img = prep_image(req["img"], grid=req.get("screen")) if req["img"] is not None else None
+        b64 = img_to_b64(img) if img is not None else None
         a64 = base64.b64encode(audio).decode() if audio else None
         chunker = Chunker(s.speaker.say) if s.speaker.enabled() else None
         clean = (lambda t: strip_board(strip_actions(t))) if kind in BOARD_KINDS else strip_actions
@@ -923,9 +910,17 @@ class Overlay(QWidget):
             parts = [{"type": "text", "text": text or "Answer the user's spoken request in the attached audio."}]
             if b64: parts.append({"type": "image_url", "image_url": {"url": "data:image/jpeg;base64," + b64}})
             if a64: parts.append({"type": "input_audio", "input_audio": {"data": a64, "format": "wav"}})
-            body = build_body(s.cfg, p, req["system"], req["history"], parts)
+            # Short voice questions do not need the default reasoning budget. Only Gemini is downgraded
+            # (its thinking tokens are billed as output); long requests, screen control and whiteboards
+            # keep exactly the effort the user chose.
+            peffort = s.cfg.get("effort", "low")
+            if (peffort == "low" and gemini_model(p) and kind == "chat" and not req.get("screen")
+                    and len(text or "") < 180):
+                peffort = "minimal"
+            body = build_body(s.cfg, p, req["system"], req["history"], parts, kind=kind, effort=peffort)
             headers = {"X-Title": "AI Overlay"}
             if p["key"]: headers["Authorization"] = "Bearer " + p["key"]
+            usage = {}
             fed = [0]
             slow = threading.Timer(1.6, lambda n=name: rid == s.req and s.note.emit(f"Waiting for {n}…")); slow.daemon = True; slow.start()
             slow2 = threading.Timer(8.0, lambda n=name: rid == s.req and s.note.emit(f"Still waiting for {n}…")); slow2.daemon = True; slow2.start()
@@ -949,10 +944,16 @@ class Overlay(QWidget):
             def opened(h, p=p):
                 s.usage.rec(p, h)
 
+            def retry(msg, delay, attempt):
+                if rid != s.req: return
+                if delay > 0: s.note.emit(f"{name} is busy - retrying in {delay:.0f} s ({attempt}/{MAX_ATTEMPTS})…")
+                else: s.note.emit(f"{name}: {str(msg)[:80]}")
+
             key = (p["url"], p["model"])
             try:
                 acc = stream_chat(p, body, headers, on_delta=on_delta, on_first=on_first, on_open=opened,
-                                  stop=lambda: rid != s.req or s.stop_ev.is_set(), cut_at=cut)
+                                  stop=lambda: rid != s.req or s.stop_ev.is_set(), cut_at=cut, usage_out=usage,
+                                  effort=peffort, on_retry=retry)
             except AIError as ex:
                 if rid != s.req: return
                 if ex.delay: s.cool[key] = time.time() + ex.delay          # let a healthy provider go first
@@ -967,7 +968,7 @@ class Overlay(QWidget):
             except Exception as ex:
                 errs.append(f"{name}: {str(ex)[:140]}"); continue
             finally:
-                slow.cancel(); slow2.cancel()
+                slow.cancel(); slow2.cancel(); s.usage.tokens(p, usage)
             if acc:
                 s.served.emit(rid, s.usage.served(p, list(dict.fromkeys(e.split(':')[0] for e in errs if not e.startswith('Speech')))))
                 if chunker and rid == s.req: chunker.feed(clean(acc), final=True)
@@ -1015,7 +1016,7 @@ class Overlay(QWidget):
 
     def on_finished(s, rid, ok):
         if rid != s.req: return
-        s._render_timer.stop(); s._flush_stream()
+        s._watchdog.stop(); s._render_timer.stop(); s._flush_stream()
         if not ok:
             if s._collapsed and s.kind not in BOARD_KINDS: s.expand()
             s._unstealth(); s.set_state("idle", "Something went wrong"); return

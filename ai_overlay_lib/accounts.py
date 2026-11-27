@@ -39,6 +39,16 @@ class Usage:
                     except (TypeError, ValueError): pass
             s._save()
 
+    def tokens(s, p, usage):
+        """Add the exact token counts reported by the provider (Gemini native reports them every chunk)."""
+        if not usage: return
+        with s.lock:
+            e = s._e(p); t = e.setdefault("tok", {"prompt": 0, "output": 0, "thoughts": 0, "total": 0})
+            for k in t:
+                try: t[k] += int(usage.get(k, 0) or 0)
+                except (TypeError, ValueError): pass
+            s._save()
+
     def limited(s, p, body):
         if re.search(r"per ?day|daily|\bRPD\b", body or "", re.I):
             with s.lock: s._e(p)["exhausted"] = True; s._save()
@@ -52,9 +62,11 @@ class Usage:
             return used, (max(0, lim - used) if lim else None), (lim or None)
 
     def line(s, p):
+        with s.lock:
+            t = s._e(p).get("tok") or {}
         used, rem, lim = s.left(p)
-        if rem is None: return f"{used} used today"
-        return f"{used} used · {rem}" + (f"/{lim}" if lim else "") + " left today"
+        base = f"{used} used today" if rem is None else f"{used} used · {rem}" + (f"/{lim}" if lim else "") + " left today"
+        return base + (f" · {t.get('total', 0) / 1000:.1f}k tok" if t.get("total") else "")
 
     def served(s, p, failed):
         t = f"{p['name']} · {p['model']} · {s.line(p)}"

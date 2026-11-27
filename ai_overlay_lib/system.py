@@ -654,8 +654,11 @@ def grab_screen(sc=None):
 
 
 def prep_image(pix, grid=False, maxw=1280):
-    """QPixmap -> QImage scaled for the model; optional labelled coordinate grid so the model can aim clicks."""
-    img = pix.toImage(); img.setDevicePixelRatio(1.0)
+    """QPixmap/QImage -> QImage scaled for the model; optional labelled grid so the model can aim clicks.
+
+    Accepts a QImage so the expensive smooth scaling and grid painting can run in the worker thread.
+    """
+    img = pix if isinstance(pix, QImage) else pix.toImage(); img.setDevicePixelRatio(1.0)
     if img.width() > maxw: img = img.scaledToWidth(maxw, Qt.TransformationMode.SmoothTransformation)
     if grid:
         img = img.convertToFormat(QImage.Format.Format_RGB32)
@@ -684,12 +687,20 @@ def transcribe(cfg, wav):
     return (r.json().get("text") or "").strip()
 
 
+_WARMED = set(); _WARM_LOCK = threading.Lock()
+
+
 def warm(urls):
+    """Open the TLS connection to each provider host once per process, not on every overlay open."""
     def go():
         for u in dict.fromkeys(urls):
             try:
                 p = urllib.parse.urlparse(u)
-                if p.scheme: SESSION.head(f"{p.scheme}://{p.netloc}", timeout=4)
+                if not p.scheme or not p.netloc: continue
+                with _WARM_LOCK:
+                    if p.netloc in _WARMED: continue
+                    _WARMED.add(p.netloc)
+                SESSION.head(f"{p.scheme}://{p.netloc}", timeout=4)
             except Exception: pass
     threading.Thread(target=go, daemon=True).start()
 

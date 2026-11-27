@@ -8,6 +8,7 @@ import sys, os, io, re, ast, csv, uuid, copy, json, wave, time, math, queue, bas
 import urllib.parse, html
 from dataclasses import dataclass, field
 import requests, keyboard, numpy as np, sounddevice as sd
+from requests.adapters import HTTPAdapter
 if sys.platform == "win32":     # must run before pyautogui/Qt: per-monitor DPI keeps coordinates right on mixed-DPI multi-monitor setups
     try:
         import ctypes; ctypes.windll.user32.SetProcessDpiAwarenessContext(ctypes.c_void_p(-4))
@@ -107,7 +108,21 @@ DEFAULTS = {
 }
 HK_LABELS = [("hk_toggle", "Open / close overlay"), ("hk_summarize", "Summarize screen"),
              ("hk_area", "Select area"), ("hk_stop", "EMERGENCY STOP (cancel actions)")]
-SESSION = requests.Session()
+def new_http_session():
+    """One pooled HTTP session: keep-alive connections are reused instead of a fresh TLS handshake per request.
+
+    requests' default pool holds only 10 connections and warns when a burst exceeds it. Streaming replies hold
+    a connection for the whole answer, so the pool is raised and retries are left to our own bounded retry loop
+    (a transport-level silent retry could duplicate an already-streamed answer).
+    """
+    s = requests.Session()
+    adapter = HTTPAdapter(pool_connections=8, pool_maxsize=24, max_retries=0, pool_block=False)
+    s.mount("https://", adapter); s.mount("http://", adapter)
+    s.headers["User-Agent"] = f"AI-Overlay/{APP_VERSION}"
+    return s
+
+
+SESSION = new_http_session()
 
 # ---------- the floating AI orb (collapsed overlay) ----------
 ORB_WIN = 112                                    # window size of the medium orb (the orb itself is drawn inside it)
@@ -254,8 +269,19 @@ def short_error(r):
         msg = str(e.get("message", r.text)) if isinstance(e, dict) else str(e)
     except Exception:
         msg = r.text or ""
-    m = re.search(r"retry in ([\d.]+)\s*s", msg, re.I) or re.search(r"retry-after[^\d]*([\d.]+)", str(r.headers), re.I)
-    delay = float(m.group(1)) if m else (30.0 if r.status_code in (429, 402) else 0.0)
+    delay = 0.0
+    m = re.search(r"retry in ([\d.]+)\s*s", msg, re.I)
+    if m: delay = float(m.group(1))
+    if not delay:                                                          # Gemini's structured RetryInfo detail
+        details = e.get("details") if isinstance(e, dict) else None
+        for d in details or []:
+            if isinstance(d, dict) and "RetryInfo" in str(d.get("@type", "")):
+                m = re.search(r"([\d.]+)s", str(d.get("retryDelay", "")))
+                if m: delay = float(m.group(1)); break
+    if not delay:
+        m = re.search(r"retry-after\D*([\d.]+)", str(r.headers), re.I)      # numeric Retry-After header
+        if m: delay = float(m.group(1))
+    if not delay and r.status_code in (429, 402): delay = 30.0
     msg = msg.split("\n")[0][:160]
     if r.status_code == 429: msg = f"rate limit / quota reached (retry in ~{int(delay)}s). " + msg
     elif r.status_code == 402 or "credits" in msg.lower(): msg = "out of credits: " + msg
@@ -280,35 +306,32 @@ SYSTEM_BASE = (
     "claim success only for [OK] lines; for [FAILED] say in one sentence what went wrong and either try ONE different approach or tell the user what to do; "
     "for [WAITING] say it is still in progress. Never repeat a sentence or a refusal; never say you cannot do something without the specific reason.")
 
-ACTIONS_DOC = """ACTIONS - to do something on the user's computer, write your short spoken reply first, then one or more fenced blocks:
+ACTIONS_DOC = """ACTIONS - to do something on the user's computer, write your short spoken reply first, then ONE fenced block:
 ```action
 {"do":"open_app","name":"spotify"}
 ```
-(several JSON objects may go in one block, one per line). Available "do" values:
-- open_app {name} / close_app {name}: any app or site (spotify, chrome, google, youtube, notepad, word, discord...).
-- remember {text} / forget {text}: durable NON-sensitive facts about the user (name, preferences, projects). Never store passwords, PINs, keys.
-- vault_get {label, mode:"show"|"copy"|"type"}: when the user wants a saved password/secret. A local master-password prompt appears; you never see the result, so never guess or repeat secrets. Never tell the user to save passwords in chat; they use Settings > Data > Secure vault.
-- plot {exprs:["sin(x)","x**2"], xmin, xmax, ymin?, ymax?, clear?}: draw functions of x on axes (use explicit * for multiplication; sin cos tan asin acos atan sinh cosh tanh exp log ln sqrt abs pi e).
-- draw {shapes:[...], clear?, view?:[xmin,xmax,ymin,ymax]}: math coordinates, y up, default view x -10..10, y about -7..7.
-  shapes: {"type":"triangle","points":[[0,0],[4,0],[2,3]],"labels":["A","B","C"],"color":"#8ab4f8","fill":"#8ab4f8"}, polygon {points} or {n,cx,cy,r},
-  circle {cx,cy,r}, ellipse {cx,cy,rx,ry}, rect {x,y,w,h}, line {x1,y1,x2,y2}, point {x,y,label}, text {x,y,text}.
-- spotify {cmd:"pause"|"play"|"ensure_playing"|"next"|"previous"|"restart"|"volume_up"|"volume_down"|"mute"} or {query:"song / artist / playlist", kind?:"track|artist|playlist|album"}: music. Transport commands are instant media keys and state-aware (play never pauses a song that is playing, pause never starts one). A query plays through the Spotify API if connected; otherwise it only opens the search and YOU must click. After you click Play on a playlist/album/track, or double-click a song row, END THE SAME BLOCK with {do:"spotify",cmd:"ensure_playing"}: it reads the real playing state, presses Play if it is still paused, and names what is playing. Opening or browsing a playlist is NOT playing.
-- youtube {query}: free, no account: finds the first YouTube result and opens that video in the browser (normally starts playing by itself). Use it for "play X on YouTube" or when Spotify cannot play it.
-- ui_list {window}, ui_click {window,name}, ui_type {window,name?,text}: control an app through UI Automation. No mouse, no keyboard, no focus change, so the user can keep working. Use ui_list first to see the control names, then ui_click / ui_type. Works for most native apps; if the result says it can't, fall back to click/type.
-- login {site?, label?}: sign in to a website with the user's saved login from the Secure vault. site = domain or name (\"github.com\"); omit it to use the website that is open now. A local prompt may ask the user to confirm or unlock; you never see the username or password. The result is the REAL outcome (signed in / already signed in / wrong password / needs the user for a code or captcha / unverified): report only that. Never retry after a wrong password; tell the user to update the saved login in Settings > Data > Secure vault. Use login for sign-ins, never vault_get type. Never ask the user for a password.
-- move_window {monitor:"primary"|"secondary"|"secondary 2", title?:"part of the window title"}: move a window (default: the frontmost one) to another monitor. The result says "verified" or "NOT moved": report exactly that.
+(several JSON objects may go in one block, one per line). Put ALL actions in ONE block at the very END; write nothing after it.
+- open_app {name} / close_app {name}: any app or site (spotify, chrome, youtube, notepad, word, discord...).
+- remember {text} / forget {text}: durable NON-sensitive facts (name, preferences, projects). Never passwords, PINs, keys.
+- vault_get {label, mode:"show"|"copy"|"type"}: a saved password/secret. A local master-password prompt appears; you never see the result, so never guess or repeat secrets. Never tell the user to save passwords in chat.
+- plot {exprs:["sin(x)","x**2"], xmin, xmax, ymin?, ymax?, clear?}: functions of x (explicit *, functions sin cos tan asin acos atan sinh cosh tanh exp log ln sqrt abs pi e).
+- draw {shapes:[...], clear?, view?:[xmin,xmax,ymin,ymax]}: math coords, y up, default x -10..10. Shapes: triangle {points,labels?,color?,fill?}, polygon {points} or {n,cx,cy,r}, circle {cx,cy,r}, ellipse {cx,cy,rx,ry}, rect {x,y,w,h}, line {x1,y1,x2,y2}, point {x,y,label}, text {x,y,text}.
+- spotify {cmd:"pause"|"play"|"ensure_playing"|"next"|"previous"|"restart"|"volume_up"|"volume_down"|"mute"} or {query:"song / artist / playlist", kind?:"track|artist|playlist|album"}: transport keys are instant. A query plays through the Spotify API if connected, otherwise it only opens the search and YOU must click. After clicking Play or double-clicking a song row, END THE SAME BLOCK with {do:"spotify",cmd:"ensure_playing"} - it reads the real state, presses Play if paused and names what plays. Browsing is NOT playing.
+- youtube {query}: finds the first YouTube result and opens that video.
+- ui_list {window}, ui_click {window,name}, ui_type {window,name?,text}: control an app through UI Automation - no mouse, no focus change. Use ui_list first, then ui_click/ui_type; fall back to click/type if it says it can't.
+- login {site?,label?}: sign in with a saved vault login; a local prompt may ask the user. Report only the real result (signed in / already / wrong password / needs the user). Never retry after a wrong password; use login, never vault_get type. Never ask for a password.
+- move_window {monitor:"primary"|"secondary"|"secondary 2", title?}: report "verified" or "NOT moved" exactly.
 Only when Screen control is ON:
-- click {x,y,button?:"left"|"right",double?:true}, move {x,y}, drag {x1,y1,x2,y2}, scroll {x,y,amount} (positive = up), type {text}, key {keys:"ctrl+l"}, wait {seconds}, observe {}.
-Put ALL actions in ONE block at the very END of your reply and write nothing after it (generation stops at the block). After control actions you automatically get a fresh screenshot. Work in small steps; when the task is finished, answer briefly with NO action block.
+- click {x,y,button?:"left"|"right",double?:true}, move {x,y}, drag {x1,y1,x2,y2}, scroll {x,y,amount} (positive = up), type {text}, key {keys:"ctrl+l"}, wait {seconds}, observe {monitor?}.
 RULES
-1. Monitors: the "Monitors" list tells you which display is Primary and which are Secondary. Coordinates always refer to the monitor in the screenshot. Never say a window/app was moved or opened unless the action result confirms it ("verified"); if it says NOT moved or failed, say so.
-2. Light mode: group steps. Never emit a "move" right before a click/drag/scroll (those already move the cursor). Put every action you already know about in ONE block; avoid single-pixel nudges and needless wait/observe steps.
-3. After open_app / spotify the app is already waited for before you get results. Do not repeat the launch. If the result says it is still loading, use ONE wait {seconds:3}, then re-check; never spam commands or loop.
-4. Music requests: act immediately (spotify action), no clarifying questions unless the request is truly ambiguous.
-5. FINISH THE JOB: a task is done only when its final effect happened (music actually playing, message actually sent, file actually saved). Searching or opening is NOT finishing: keep going until a result or the screen confirms the final effect. Never end with "I searched..." when the user asked you to do something.
-6. Prefer background methods, in this order: dedicated actions (spotify, move_window, open_app) -> ui_list/ui_click/ui_type -> click/type with screenshots as the last resort. The user keeps working while you act; physical mouse/keyboard actions wait for them to pause.
-7. Speed: put every step you already know in ONE block; do not request another screenshot after an action whose result already confirms success.
-8. observe {monitor:"secondary"|"primary"} switches which monitor you see; requests that name another screen, or an app living on it, are targeted automatically."""
+1. Monitors: coordinates use the monitor in the screenshot. Never say a window/app was moved or opened without a confirming result; if it says NOT moved or failed, say so.
+2. Group steps: no move right before click/drag/scroll; put every known step in ONE block; no single-pixel nudges or pointless wait/observe.
+3. open_app/spotify wait for the app already: do not repeat the launch; if still loading use ONE wait {seconds:3} then re-check.
+4. Music requests: act immediately, no clarifying question.
+5. FINISH THE JOB: searching or opening is not finishing; continue until the final effect happened (music playing, message sent, file saved) or a result confirms it. Never end with "I searched...".
+6. Prefer background methods: dedicated actions -> ui_list/ui_click/ui_type -> click/type last. The user keeps working; physical input waits for them to pause.
+7. Speed: do not request another screenshot after an action whose result already confirms success.
+8. observe {monitor:"secondary"|"primary"} switches which screen you see; requests naming another screen are targeted automatically."""
 
 SUMMARY_PROMPT = ("Summarize what's on this screen: one line saying what it is, then 3-5 key points. "
                   "Read-only summary: do not suggest or perform actions.")
@@ -586,7 +609,7 @@ class Memory:
     def export(s, path):
         with s.lock: json.dump(s.items, open(path, "w", encoding="utf-8"), indent=1, ensure_ascii=False)
 
-    def stats(s, limit=3000):
+    def stats(s, limit=1800):
         """(total items, items that fit in the prompt budget, characters used, budget)."""
         inc = [ln for ln in s.prompt(limit).split("\n") if ln]
         return len(s.items), len(inc), len("\n".join(inc)), limit
