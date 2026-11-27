@@ -5,15 +5,27 @@ Nothing in this module is ever sent to a model: the vault reveals a login only t
 from .core import *
 
 class Usage:
-    """Per-provider request counter that resets daily. Groq also reports the real remaining quota in response headers;
-    for other providers 'left' = the daily limit you set in the provider dialog minus today's count."""
+    """Per-provider-CONFIGURATION counters that reset daily.
+
+    The key is the configuration's stable id, never its name/model/key: duplicate Gemini entries stay independent.
+    Groq also reports the real remaining quota in response headers; for other providers 'left' = the daily limit
+    set on that configuration minus today's count.
+    """
     def __init__(s, path):
         s.path = path; s.lock = threading.Lock()
         try: s.d = json.load(open(path, encoding="utf-8"))
         except Exception: s.d = {}
 
     @staticmethod
-    def key(p): return f"{p['name']}|{p['model']}"
+    def key(p):
+        """The stable provider-configuration id, never the display name or model.
+
+        Two Gemini entries can share a name, model and even a key; they are still different configurations and
+        must never share counters. `normalize_providers` guarantees an id in normal use; the fallback keeps
+        unidentified dicts separate instead of merging them under a name.
+        """
+        pid = str(p.get("id") or "").strip()
+        return pid or "unidentified-" + str(id(p))
 
     @staticmethod
     def today(p):   # Gemini's daily quota resets at midnight Pacific (approximated as UTC-8); everything else: UTC
@@ -22,8 +34,32 @@ class Usage:
 
     def _e(s, p):
         k, day = s.key(p), s.today(p); e = s.d.get(k)
-        if not e or e.get("day") != day: e = s.d[k] = {"day": day, "count": 0}
+        if not e or e.get("day") != day:
+            hist = list((e or {}).get("history") or [])
+            if e and e.get("day"):                       # keep a compact, per-configuration history
+                snap = {"day": e["day"], "count": int(e.get("count", 0))}
+                if e.get("errors"): snap["errors"] = int(e["errors"])
+                if e.get("tok"): snap["tok"] = dict(e["tok"])
+                hist = (hist + [snap])[-30:]
+            e = s.d[k] = {"day": day, "count": 0}
+            if hist: e["history"] = hist
         return e
+
+    def migrate(s, providers):
+        """Move old name|model counters onto an id only when exactly one configuration matches.
+
+        The old key was shared by duplicate Gemini entries, so a shared counter cannot be attributed to one of
+        them. In that case it is deliberately left alone rather than copied to the wrong configuration.
+        """
+        with s.lock:
+            changed = False
+            for p in providers or []:
+                pid = str(p.get("id") or "").strip(); legacy = f"{p.get('name')}|{p.get('model')}"
+                if not pid or pid == legacy or legacy not in s.d or pid in s.d: continue
+                matches = [q for q in providers if f"{q.get('name')}|{q.get('model')}" == legacy]
+                if len(matches) == 1:
+                    s.d[pid] = s.d.pop(legacy); changed = True
+            if changed: s._save()
 
     def _save(s):
         try:
@@ -39,9 +75,16 @@ class Usage:
                     except (TypeError, ValueError): pass
             s._save()
 
+    def err(s, p, message=""):
+        """Count a failed request against the exact configuration that made it."""
+        with s.lock:
+            e = s._e(p); e["errors"] = int(e.get("errors", 0)) + 1
+            if message: e["last_error"] = str(message)[:160]
+            s._save()
+
     def tokens(s, p, usage):
         """Add the exact token counts reported by the provider (Gemini native reports them every chunk)."""
-        if not usage: return
+        if not usage or not any(int(usage.get(k, 0) or 0) for k in ("prompt", "output", "thoughts", "total")): return
         with s.lock:
             e = s._e(p); t = e.setdefault("tok", {"prompt": 0, "output": 0, "thoughts": 0, "total": 0})
             for k in t:
@@ -63,13 +106,15 @@ class Usage:
 
     def line(s, p):
         with s.lock:
-            t = s._e(p).get("tok") or {}
+            e = s._e(p); t = e.get("tok") or {}; errs = int(e.get("errors", 0))
         used, rem, lim = s.left(p)
         base = f"{used} used today" if rem is None else f"{used} used · {rem}" + (f"/{lim}" if lim else "") + " left today"
+        if errs: base += f" · {errs} err"
         return base + (f" · {t.get('total', 0) / 1000:.1f}k tok" if t.get("total") else "")
 
-    def served(s, p, failed):
-        t = f"{p['name']} · {p['model']} · {s.line(p)}"
+    def served(s, p, failed, position=None, total=None):
+        tag = f" ({position}/{total})" if position and total else ""
+        t = f"{p['name']}{tag} · {p['model']} · {s.line(p)}"
         return t + (f"   (after {', '.join(failed)} failed)" if failed else "")
 
     def reset(s):

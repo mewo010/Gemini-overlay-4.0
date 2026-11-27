@@ -62,9 +62,36 @@ PRESETS = {   # {effort} is replaced with the "Thinking effort" setting at reque
 
 
 def make_provider(preset, **over):
-    d = {"name": preset, "enabled": True, "key": "", **copy.deepcopy(PRESETS[preset])}
+    d = {"id": uuid.uuid4().hex, "name": preset, "enabled": True, "key": "", **copy.deepcopy(PRESETS[preset])}
     d.update(over)
     return d
+
+
+def normalize_providers(cfg):
+    """Give every provider configuration a stable, unique id and return True when the list changed.
+
+    The list order IS the priority order and is never sorted here. Identical provider names, models or keys are
+    deliberately allowed: each entry is a separate configuration with its own usage, limits and fallback slot.
+    An id survives reordering, editing and restarts; it is the only key used for accounting.
+    """
+    changed = False
+    clean, seen = [], set()
+    for raw in list(cfg.get("providers") or []):
+        if not isinstance(raw, dict):
+            changed = True; continue
+        p = dict(raw)                       # never let two references share a mutated id
+        pid = str(p.get("id") or "").strip()
+        if not pid or pid in seen:
+            pid = uuid.uuid4().hex; changed = True
+        if p.get("id") != pid:
+            p["id"] = pid; changed = True
+        if not isinstance(p.get("enabled", True), bool):
+            p["enabled"] = _as_bool(p.get("enabled"), True); changed = True
+        seen.add(pid)
+        clean.append(p)
+    if clean != (cfg.get("providers") or []): changed = True
+    cfg["providers"] = clean
+    return changed
 
 
 try:
@@ -245,18 +272,23 @@ def load_cfg():
             try: cfg.update(json.load(open(path, encoding="utf-8")))
             except Exception: pass
     legacy = {k: cfg.pop(k, "") for k in ("api_key", "model", "gemini_key", "gemini_model")}   # v1 settings -> providers
+    legacy_added = False
     if not cfg["providers"]:
         ork = legacy["api_key"] or os.getenv("OPENROUTER_API_KEY", "")
         gk = legacy["gemini_key"] or os.getenv("GEMINI_API_KEY", "")
-        if ork: cfg["providers"].append(make_provider("OpenRouter", key=ork, **({"model": legacy["model"]} if legacy["model"] else {})))
-        if gk: cfg["providers"].append(make_provider("Gemini", key=gk, **({"model": legacy["gemini_model"]} if legacy["gemini_model"] else {})))
+        if ork: cfg["providers"].append(make_provider("OpenRouter", key=ork, **({"model": legacy["model"]} if legacy["model"] else {}))); legacy_added = True
+        if gk: cfg["providers"].append(make_provider("Gemini", key=gk, **({"model": legacy["gemini_model"]} if legacy["gemini_model"] else {}))); legacy_added = True
     if not cfg["tts_key"]:
         cfg["tts_key"] = os.getenv("ELEVENLABS_API_KEY", "")
+    if normalize_providers(cfg) or legacy_added:
+        try: save_cfg(cfg)                 # persist ids once, so usage stays attached across restarts
+        except Exception: pass
     normalize_orb(cfg)
     return cfg
 
 
 def save_cfg(cfg):
+    normalize_providers(cfg)                          # ids must be persisted with the list order
     normalize_orb(cfg)                                # never persist a value that could hide the orb
     json.dump(cfg, open(CFG_PATH, "w", encoding="utf-8"), indent=2)
 

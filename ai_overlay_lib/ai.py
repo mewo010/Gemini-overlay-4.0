@@ -17,6 +17,7 @@ CONNECT_TIMEOUT = 8.0          # TCP/TLS connect
 FIRST_TOKEN_TIMEOUT = 20.0     # no first byte/token -> retry (the old 25 s read timeout was fatal)
 IDLE_TIMEOUT = 30.0            # a gap between tokens longer than this means the stream is dead
 TOTAL_TIMEOUT = 95.0           # hard ceiling for ALL attempts of one request
+PROVIDER_READY_TIMEOUT = 30.0  # when other providers are waiting: give one provider this long to START answering
 MAX_ATTEMPTS = 3               # one try + two retries; avoids hammering a struggling endpoint
 RETRY_BASE = 1.6               # 1.6 s, 3.2 s ... plus jitter
 RETRY_CAP = 30.0               # never sleep longer than this (even if Retry-After asks for more)
@@ -106,28 +107,24 @@ def build_body(cfg, provider, system, history, user_parts, stream=True, kind="ch
 
 
 def provider_chain(providers, cool=None, usage=None, now=None):
-    """Usable providers, in the user's order, skipping those in a cooldown.
+    """Eligible providers in EXACTLY the saved/displayed order.
 
-    Cooling providers are only used when every provider is cooling (so a single provider that hit a rate
-    limit is still retried, but a healthy alternative is always preferred).
+    This is the single source of truth for priority. It never sorts by quota, model, cooldown or usage: doing
+    that silently created a second priority order in the backend. A provider is skipped only when it cannot
+    possibly be attempted (disabled, missing URL/model, or missing key for a non-local endpoint), and a failed
+    provider falls through to the next entry in this same list.
+
+    `cool` and `usage` are accepted for call-site compatibility but deliberately do not affect the order.
     """
-    cool = cool or {}
-    now = time.time() if now is None else now
-    ready, cooling = [], []
+    out = []
     for p in providers or []:
+        if not isinstance(p, dict): continue
         url = str(p.get("url") or "")
         if not (p.get("enabled", True) and url and p.get("model")): continue
         local = any(h in url for h in ("localhost", "127.0.0.1"))
         if not (p.get("key") or local): continue
-        if (cool.get((url, p.get("model")), 0) > now):
-            cooling.append(((cool[(url, p.get("model"))]), p)); continue
-        ready.append(p)
-    if usage is not None:
-        try: ready.sort(key=lambda p: usage.left(p)[1] == 0)      # out-of-quota last, order otherwise kept
-        except Exception: pass
-    if ready: return ready
-    cooling.sort(key=lambda x: x[0])
-    return [p for _until, p in cooling]
+        out.append(p)
+    return out
 
 
 # ---------- Gemini native wire format ----------
@@ -260,6 +257,14 @@ def _extract(j):
     return "", "", ""
 
 
+def _add_usage(total, part):
+    """Sum the exact counts of separate HTTP attempts (a stream's own chunks are already de-duplicated by max)."""
+    if total is None or not part: return
+    for k in ("prompt", "output", "thoughts", "total"):
+        try: total[k] = int(total.get(k, 0) or 0) + int(part.get(k, 0) or 0)
+        except (TypeError, ValueError): pass
+
+
 def _capture_usage(j, out):
     """Exact token counts when the provider reports them (Gemini: every chunk; OpenAI: final)."""
     if out is None or not isinstance(j, dict): return
@@ -342,6 +347,10 @@ def _stream_once(url, hdrs, body, on_delta, on_first, on_reason, on_open, stop, 
         state["aborted"] = state["aborted"] or why
         close()
 
+    # A pending POST cannot be interrupted by closing a response we do not have yet, so the socket read
+    # timeout itself must not outlive the time this attempt is allowed to take. Without this, a provider
+    # that accepts the connection and then stalls can block the whole fallback chain.
+    read_timeout = max(0.25, min(idle_timeout, first_timeout))
     left = max(0.5, deadline - time.time())
     t_first = threading.Timer(min(first_timeout, left), lambda: abort("first")); t_first.daemon = True
     t_total = threading.Timer(left, lambda: abort("total")); t_total.daemon = True
@@ -349,7 +358,7 @@ def _stream_once(url, hdrs, body, on_delta, on_first, on_reason, on_open, stop, 
     started = time.time()
     try:
         try:
-            r = SESSION.post(url, json=body, stream=True, timeout=(CONNECT_TIMEOUT, idle_timeout), headers=hdrs)
+            r = SESSION.post(url, json=body, stream=True, timeout=(min(CONNECT_TIMEOUT, read_timeout), read_timeout), headers=hdrs)
         except Exception as ex:
             raise AIError(f"could not connect ({str(ex)[:110]})")
         box["r"] = r
@@ -358,6 +367,9 @@ def _stream_once(url, hdrs, body, on_delta, on_first, on_reason, on_open, stop, 
             raise AIError(msg, status=r.status_code, delay=delay)
         if on_open: on_open(r.headers)
         ctype = str(r.headers.get("content-type") or "").lower()
+        if state["aborted"]:                                  # a JSON response that arrived after the deadline
+            raise AIError("no response in %.1f s" % first_timeout if state["aborted"] == "first"
+                          else "took too long")
         if "event-stream" not in ctype and "application/json" in ctype:
             try: j = r.json()
             except Exception: raise AIError("unreadable response")
@@ -375,7 +387,7 @@ def _stream_once(url, hdrs, body, on_delta, on_first, on_reason, on_open, stop, 
                 except AIError: raise
                 except Exception: pass
             if state["aborted"]:
-                raise AIError("no response in %d s" % int(first_timeout) if state["aborted"] == "first"
+                raise AIError("no response in %.1f s" % first_timeout if state["aborted"] == "first"
                               else "took too long", partial="".join(text))
             if not raw: continue
             line = raw.decode("utf-8", "replace").strip()
@@ -412,7 +424,7 @@ def _stream_once(url, hdrs, body, on_delta, on_first, on_reason, on_open, stop, 
                 raise AIError("took too long", partial=full)
         full = "".join(text)
         if state["aborted"]:
-            raise AIError("no response in %d s" % int(first_timeout) if state["aborted"] == "first"
+            raise AIError("no response in %.1f s" % first_timeout if state["aborted"] == "first"
                           else "took too long", partial=full)
         if not full:
             if state["finish"] and state["finish"].upper() in ("SAFETY", "BLOCKLIST", "PROHIBITED_CONTENT"):
@@ -424,7 +436,7 @@ def _stream_once(url, hdrs, body, on_delta, on_first, on_reason, on_open, stop, 
     except Exception as ex:
         full = "".join(text)
         why = state["aborted"]
-        if why == "first": raise AIError(f"no response in {int(first_timeout)} s", partial=full)
+        if why == "first": raise AIError(f"no response in {first_timeout:.1f} s", partial=full)
         if why == "total": raise AIError(f"no complete answer after {int(time.time() - started)} s", partial=full)
         if full: raise AIError(f"connection interrupted ({str(ex)[:110]})", partial=full)
         raise AIError(f"connection failed ({str(ex)[:110]})")
@@ -435,11 +447,17 @@ def _stream_once(url, hdrs, body, on_delta, on_first, on_reason, on_open, stop, 
 def stream_chat(provider, body, headers=None, on_delta=None, on_first=None, on_reason=None,
                 on_open=None, stop=None, cut_at=None, usage_out=None, effort=None, on_retry=None,
                 first_timeout=FIRST_TOKEN_TIMEOUT, idle_timeout=IDLE_TIMEOUT,
-                total_timeout=TOTAL_TIMEOUT, max_attempts=MAX_ATTEMPTS):
+                total_timeout=TOTAL_TIMEOUT, max_attempts=MAX_ATTEMPTS, pre_response_timeout=None):
     """POST one request and consume the stream, calling on_delta(full_text) as content arrives.
 
     Retries temporary congestion with exponential backoff + jitter, honouring Retry-After/RetryInfo.
     `on_retry(message, delay, attempt)` is called before each wait so the UI can say what is happening.
+
+    `pre_response_timeout` bounds the time spent trying to get the FIRST token (including all retries).
+    Once text starts, the normal total/idle deadlines apply, so a long answer is never cut short just because
+    another provider is configured. When it expires the caller moves to the next provider immediately instead
+    of waiting through a long Retry-After.
+
     Returns the full answer; raises AIError with a readable reason (and any partial text).
     """
     hdrs = {"Accept": "text/event-stream", "Content-Type": "application/json"}
@@ -457,12 +475,25 @@ def stream_chat(provider, body, headers=None, on_delta=None, on_first=None, on_r
         except Exception:
             url, payload_hdrs, payload = provider.get("url", ""), hdrs, body
     compat = (provider.get("url", ""), hdrs, body)
-    deadline = time.time() + total_timeout
+    start = time.time()
+    deadline = start + total_timeout
+    ready_deadline = start + min(total_timeout, float(pre_response_timeout)) if pre_response_timeout else None
     last = None
     for attempt in range(1, max(1, int(max_attempts)) + 1):
+        now = time.time()
+        if ready_deadline is not None and now >= ready_deadline:
+            why = f"provider did not respond within {float(pre_response_timeout):.1f} s"
+            raise AIError(f"{last.message} ({why})" if last else why,
+                          last.status if last else None, last.delay if last else 0.0)
+        first_budget = first_timeout
+        if ready_deadline is not None: first_budget = max(0.5, min(first_timeout, ready_deadline - now))
+        attempt_usage = {}
         try:
-            return _stream_once(url, payload_hdrs, payload, on_delta, on_first, on_reason, on_open, stop,
-                                cut_at, first_timeout, idle_timeout, deadline, usage_out)
+            try:
+                return _stream_once(url, payload_hdrs, payload, on_delta, on_first, on_reason, on_open, stop,
+                                    cut_at, first_budget, idle_timeout, deadline, attempt_usage)
+            finally:
+                _add_usage(usage_out, attempt_usage)              # each HTTP attempt is counted once, even on failure
         except AIError as ex:
             last = ex
             if ex.partial: raise                                  # never replay text the user already saw
@@ -471,12 +502,19 @@ def stream_chat(provider, body, headers=None, on_delta=None, on_first=None, on_r
                 url, payload_hdrs, payload = compat
                 if on_retry: on_retry("native endpoint refused this model, using the compatible endpoint", 0, attempt)
                 continue
+            if ready_deadline is not None and time.time() >= ready_deadline:
+                raise AIError(f"{ex.message} (provider did not respond within {float(pre_response_timeout):.1f} s)",
+                              ex.status, ex.delay)
             if not _retryable(ex) or attempt >= max_attempts:
                 if attempt > 1: raise AIError(f"{ex.message} (after {attempt} attempts)", ex.status, ex.delay)
                 raise
             delay = _retry_delay(ex, attempt)
-            if time.time() + delay >= deadline:
-                raise AIError(f"{ex.message} (no time left to retry)", ex.status, ex.delay)
+            if ready_deadline is not None and delay > 4.0:
+                raise AIError(f"{ex.message} (provider asked to wait {delay:.0f} s; switching provider)", ex.status, ex.delay)
+            limit = deadline if ready_deadline is None else min(deadline, ready_deadline)
+            if time.time() + delay >= limit:
+                why = "before switching provider" if ready_deadline is not None else "to retry"
+                raise AIError(f"{ex.message} (no time left {why})", ex.status, ex.delay)
             if on_retry: on_retry(ex.message, delay, attempt)
             if _wait(delay, stop): raise AIError("cancelled")
     raise last or AIError("empty response")

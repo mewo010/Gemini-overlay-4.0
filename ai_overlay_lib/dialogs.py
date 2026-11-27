@@ -19,7 +19,7 @@ DARK = """
 
 class ProviderDialog(QDialog):
     def __init__(s, p=None, parent=None):
-        super().__init__(parent); s.setWindowTitle("Model provider"); s.setMinimumWidth(560); s.setStyleSheet(SETTINGS_QSS); s.result_p = None
+        super().__init__(parent); s.setWindowTitle("Model provider"); s.setMinimumWidth(560); s.setStyleSheet(SETTINGS_QSS); s.result_p = None; s.pid = (p or {}).get("id")
         f = QFormLayout(s)
         s.preset = QComboBox(); s.preset.addItems(list(PRESETS))
         s.name = QLineEdit(); s.url = QLineEdit(); s.url.setPlaceholderText("https://…/v1/chat/completions (OpenAI-compatible)")
@@ -51,7 +51,8 @@ class ProviderDialog(QDialog):
         except ValueError as ex: QMessageBox.warning(s, "Provider", f"Extra JSON is invalid: {ex}"); return
         if not s.url.text().strip().startswith("http") or not s.model.text().strip():
             QMessageBox.warning(s, "Provider", "A chat URL (http…) and a model name are required."); return
-        s.result_p = {"name": s.name.text().strip() or "Custom", "url": s.url.text().strip(), "key": s.key.text().strip(),
+        s.result_p = {"id": s.pid or uuid.uuid4().hex,
+                      "name": s.name.text().strip() or "Custom", "url": s.url.text().strip(), "key": s.key.text().strip(),
                       "model": s.model.text().strip(), "extra": extra, "vision": s.vision.isChecked(),
                       "audio": s.audio.isChecked(), "enabled": s.enabled.isChecked(), "daily_limit": s.daily.value()}
         super().accept()
@@ -501,8 +502,8 @@ class Settings(QDialog):
         for txt, fn in (("Add", s.p_add), ("Edit", s.p_edit), ("Remove", s.p_del), ("↑", lambda: s.p_move(-1)), ("↓", lambda: s.p_move(1))):
             b = QPushButton(txt); b.clicked.connect(fn); row.addWidget(b)
         row.addStretch(); v.addLayout(row); s.plist.itemDoubleClicked.connect(lambda _: s.p_edit())
-        c2, f2, v2 = mk_card("Usage today", "Requests sent per provider (resets daily; Gemini at midnight Pacific). “Left” uses the daily limit set for the provider - "
-                                            "Groq reports the real number itself. Providers that run out are tried last.")
+        c2, f2, v2 = mk_card("Usage today", "Requests, errors and exact tokens are tracked separately for every configuration (resets daily; Gemini at midnight Pacific). "
+                                            "“Left” uses that configuration's daily limit - Groq reports the real number itself. The list is tried strictly top to bottom; a failure falls through to the next entry.")
         s.usage_lbl = QLabel(""); s.usage_lbl.setWordWrap(True); v2.addWidget(s.usage_lbl)
         rb = QPushButton("Reset counters"); rb.clicked.connect(lambda: (s.app.ov.usage.reset(), s.p_usage())); v2.addWidget(rb, 0, Qt.AlignmentFlag.AlignLeft)
         s.utimer = QTimer(s); s.utimer.timeout.connect(lambda: s.isVisible() and s.p_usage()); s.utimer.start(2000)
@@ -862,20 +863,22 @@ class Settings(QDialog):
         while s.kform.rowCount(): s.kform.removeRow(0)
         s.krows = []
         if not s.provs: s.kform.addRow(hint_label("No providers yet - add one in the Providers tab."))
-        for p in s.provs:
+        for i, p in enumerate(s.provs, 1):
             w = SecretEdit("No key set" if p.get("key", "") == "" else ""); w.setText(p.get("key", ""))
-            s.kform.addRow(f"{p['name']}  ({p['model']})", w); s.krows.append((p, w))
+            s.kform.addRow(f"{i}. {p['name']}  ({p['model']})", w); s.krows.append((p, w))
 
     def k_collect(s):
         for p, w in s.krows: p["key"] = w.text()
 
     def p_usage(s):
         u = s.app.ov.usage
-        s.usage_lbl.setText("\n".join(f"{'●' if p.get('enabled', True) else '○'}  {p['name']} · {p['model']}  -  {u.line(p)}" for p in s.provs) or "No providers yet.")
+        s.usage_lbl.setText("\n".join(f"{i}. {'●' if p.get('enabled', True) else '○'}  {p['name']} · {p['model']}  -  {u.line(p)}"
+                                     for i, p in enumerate(s.provs, 1)) or "No providers yet.")
 
     # ---------- providers list ----------
     def p_refresh(s, sel=0):
-        s.plist.clear(); s.plist.addItems([f"{'✔' if p.get('enabled', True) else '✖'} {p['name']} - {p['model']}" for p in s.provs])
+        s.plist.clear(); s.plist.addItems([f"{i}. {'✔' if p.get('enabled', True) else '✖'} {p['name']} - {p['model']}"
+                                           for i, p in enumerate(s.provs, 1)])
         if s.provs: s.plist.setCurrentRow(min(max(sel, 0), len(s.provs) - 1))
         s.k_rebuild(); s.p_usage()
 
@@ -887,7 +890,9 @@ class Settings(QDialog):
         r = s.plist.currentRow()
         if r < 0: return
         s.k_collect(); d = ProviderDialog(s.provs[r], parent=s)
-        if d.exec() and d.result_p: s.provs[r] = d.result_p; s.p_refresh(r)
+        if d.exec() and d.result_p:
+            d.result_p["id"] = s.provs[r].get("id") or d.result_p.get("id") or uuid.uuid4().hex
+            s.provs[r] = d.result_p; s.p_refresh(r)
 
     def p_del(s):
         r = s.plist.currentRow()

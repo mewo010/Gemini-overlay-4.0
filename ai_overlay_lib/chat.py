@@ -9,7 +9,7 @@ from .panel import *
 from .orb_animation import should_hover_expand
 from .chat_animation import *
 from .ai import (provider_chain, build_body, stream_chat, AIError, trim_history, gemini_model,
-                 TOTAL_TIMEOUT, MAX_ATTEMPTS)
+                 TOTAL_TIMEOUT, MAX_ATTEMPTS, PROVIDER_READY_TIMEOUT)
 
 # ---------- main overlay ----------
 CONTROL = {"click", "move", "drag", "scroll", "type", "key", "wait"}
@@ -34,10 +34,10 @@ class Overlay(QWidget):
         s.rec = Recorder(); s.speaker = Speaker(cfg); s.speaker.err_cb = s.note.emit
         s.messages = []; s.pending = None; s.reply = ""; s.kind = "chat"
         s.region = None; s.state = "idle"; s.req = 0; s.sel = None; s._grp = None; s._grp_done = None; s.canvas = None
-        s.cool = {}; s.step = 0; s.stop_ev = threading.Event(); s._stealth = False; s._sc = None; s.meta = None
+        s.step = 0; s.stop_ev = threading.Event(); s._stealth = False; s._sc = None; s.meta = None
         s.cur = AICursor(); s._cur_scr = None; s._cur_was = False; s._scr_cache = []; s._cur_dim = QTimer(s); s._cur_dim.setSingleShot(True)
         s._cur_dim.timeout.connect(lambda: s.cur.setWindowOpacity(0.45)); s._notice_only = False; s.repairs = 0; s.recoveries = 0; s._last_auto = False; s.exec_lines = []; s.fail_streak = False; s._run_t0 = 0.0
-        s.usage = Usage(USAGE_PATH); s._closing = False; s.scr = None; s.blocked = lambda: False      # blocked(): App says Settings is open -> no automation
+        s.usage = Usage(USAGE_PATH); s.usage.migrate(cfg.get("providers") or []); s._closing = False; s.scr = None; s.blocked = lambda: False      # blocked(): App says Settings is open -> no automation
 
         outer = QVBoxLayout(s); outer.setContentsMargins(16, 16, 16, 16)
         panel = QFrame(); panel.setObjectName("panel"); outer.addWidget(panel)
@@ -511,6 +511,7 @@ class Overlay(QWidget):
         if not on: s.speaker.stop()
 
     def on_note(s, msg):
+        if msg.startswith("Answering with"): s._answer_with = msg[:110]
         if s.state != "listening":
             s.status.setText(msg[:110])
             if s.state == "thinking" and s.pill is not None: s.pill.set_text(msg)      # the pill keeps up with the real stage
@@ -810,8 +811,8 @@ class Overlay(QWidget):
             s.ask(text=text, audio=audio, pix=s.region)
 
     def providers(s):
-        """Usable providers; ones in a cooldown are skipped unless nothing else is left."""
-        return provider_chain(s.cfg["providers"], s.cool, s.usage)
+        """Eligible providers exactly in the order shown in Settings (the single priority source)."""
+        return provider_chain(s.cfg["providers"])
 
     def system_prompt(s, kind, screen, img):
         """`img` may be a (width, height) tuple: the screenshot only needs encoding in the worker thread."""
@@ -839,7 +840,7 @@ class Overlay(QWidget):
     def ask(s, text=None, audio=None, pix=None, screen=False, kind="chat", auto=False):
         if s.rec.stream: s.rec.stop()
         if not auto: s.speaker.stop(); s.step = 0; s.stop_ev.clear(); s.recoveries = 0; s.fail_streak = False; s.exec_lines = []; s._exec_render()
-        s._last_auto = auto; s.req += 1; rid = s.req; provs = s.providers()
+        s._last_auto = auto; s.req += 1; rid = s.req; provs = s.providers(); s._answer_with = ""
         if not provs:
             s.set_state("idle", "No provider"); s.partial.emit(rid, "⚠️ Add a provider + API key in ⚙ Settings → Providers."); return
         # Copy the pixmap once on the GUI thread, then scale/grid/encode in the worker: a 4K screenshot
@@ -863,7 +864,10 @@ class Overlay(QWidget):
                    history=trim_history(s.messages), system=s.system_prompt(kind, screen, img_size))
         s.set_state("thinking", "Thinking…")
         threading.Thread(target=s.worker, args=(rid, req, provs), daemon=True).start()
-        s._watchdog_rid = rid; s._watchdog.start(int((TOTAL_TIMEOUT + 25) * 1000))
+        # A request can legitimately use one pre-response budget per provider before the last one gets the
+        # full streaming budget. The watchdog is a last-resort ceiling, not the normal timeout path.
+        budget = PROVIDER_READY_TIMEOUT * max(0, len(provs) - 1) + TOTAL_TIMEOUT + 25
+        s._watchdog_rid = rid; s._watchdog.start(int(max(TOTAL_TIMEOUT + 25, budget) * 1000))
 
     def _request_timed_out(s):
         """Last line of defence: even if a worker thread dies in an unexpected way, the UI never stays stuck."""
@@ -902,11 +906,17 @@ class Overlay(QWidget):
         a64 = base64.b64encode(audio).decode() if audio else None
         chunker = Chunker(s.speaker.say) if s.speaker.enabled() else None
         clean = (lambda t: strip_board(strip_actions(t))) if kind in BOARD_KINDS else strip_actions
-        for p in provs:
+        n = len(provs)
+        for i, p in enumerate(provs, 1):
             if rid != s.req: return
             name = p["name"]
-            if b64 and not p.get("vision", True): errs.append(f"{name}: no image support"); continue
-            if a64 and not p.get("audio", False): errs.append(f"{name}: no audio support"); continue
+            label = f"{name} (provider {i}/{n})"
+            if b64 and not p.get("vision", True):
+                s.usage.err(p, "no image support"); errs.append(f"{name} (provider {i}/{n}): no image support")
+                continue
+            if a64 and not p.get("audio", False):
+                s.usage.err(p, "no audio support"); errs.append(f"{name} (provider {i}/{n}): no audio support")
+                continue
             parts = [{"type": "text", "text": text or "Answer the user's spoken request in the attached audio."}]
             if b64: parts.append({"type": "image_url", "image_url": {"url": "data:image/jpeg;base64," + b64}})
             if a64: parts.append({"type": "input_audio", "input_audio": {"data": a64, "format": "wav"}})
@@ -922,16 +932,25 @@ class Overlay(QWidget):
             if p["key"]: headers["Authorization"] = "Bearer " + p["key"]
             usage = {}
             fed = [0]
-            slow = threading.Timer(1.6, lambda n=name: rid == s.req and s.note.emit(f"Waiting for {n}…")); slow.daemon = True; slow.start()
-            slow2 = threading.Timer(8.0, lambda n=name: rid == s.req and s.note.emit(f"Still waiting for {n}…")); slow2.daemon = True; slow2.start()
+            streamed = [None]
+            # When another provider is waiting, only give this one a short window to START answering. Once
+            # the first token arrives, the full total deadline applies and the answer is never cut short.
+            attempts = MAX_ATTEMPTS if i == n else 2
+            ready = None if i == n else PROVIDER_READY_TIMEOUT     # the last provider gets the full stream budget
+            if rid == s.req:
+                s.note.emit(f"Connecting to {label}…" if i == 1 else
+                            f"{provs[i-2]['name']} unavailable. Switching to {label}…")
+            slow = threading.Timer(1.6, lambda l=label: rid == s.req and s.note.emit(f"Waiting for {l}…")); slow.daemon = True; slow.start()
+            slow2 = threading.Timer(8.0, lambda l=label: rid == s.req and s.note.emit(f"Still waiting for {l}…")); slow2.daemon = True; slow2.start()
 
-            def on_first():
+            def on_first(l=label):
                 """The first token arrived: stop the 'waiting' timers and say what is really happening."""
                 slow.cancel(); slow2.cancel()
-                if rid == s.req: s.note.emit("Answering…")
+                if rid == s.req: s.note.emit(f"Answering with {l}…")
 
             def on_delta(full):
                 if rid != s.req: return
+                streamed[0] = full
                 s.partial.emit(rid, full)
                 if chunker and (len(full) - fed[0] >= 60 or full.rstrip().endswith((".", "!", "?"))):
                     fed[0] = len(full); chunker.feed(clean(full))
@@ -944,36 +963,45 @@ class Overlay(QWidget):
             def opened(h, p=p):
                 s.usage.rec(p, h)
 
-            def retry(msg, delay, attempt):
+            def retry(msg, delay, attempt, name=name, i=i, attempts=attempts):
                 if rid != s.req: return
-                if delay > 0: s.note.emit(f"{name} is busy - retrying in {delay:.0f} s ({attempt}/{MAX_ATTEMPTS})…")
+                if delay > 0:
+                    s.note.emit(f"{name} is busy - retry {attempt}/{attempts} for provider {i}/{n} in {delay:.0f} s…")
                 else: s.note.emit(f"{name}: {str(msg)[:80]}")
 
-            key = (p["url"], p["model"])
+            def failed():
+                return list(dict.fromkeys(e.split(':')[0] for e in errs if not e.startswith('Speech')))
+
             try:
                 acc = stream_chat(p, body, headers, on_delta=on_delta, on_first=on_first, on_open=opened,
                                   stop=lambda: rid != s.req or s.stop_ev.is_set(), cut_at=cut, usage_out=usage,
-                                  effort=peffort, on_retry=retry)
+                                  effort=peffort, on_retry=retry, max_attempts=attempts,
+                                  pre_response_timeout=ready)
             except AIError as ex:
                 if rid != s.req: return
-                if ex.delay: s.cool[key] = time.time() + ex.delay          # let a healthy provider go first
-                elif ex.status is not None or ex.partial: s.cool[key] = time.time() + 4.0
+                s.usage.err(p, ex.message)
                 if ex.status == 429: s.usage.limited(p, ex.message)
                 if ex.partial:                                        # keep what arrived, explain the cut
-                    s.served.emit(rid, s.usage.served(p, list(dict.fromkeys(e.split(':')[0] for e in errs if not e.startswith('Speech')))))
+                    s.served.emit(rid, s.usage.served(p, failed(), i, n))
                     if chunker: chunker.feed(clean(ex.partial), final=True)
                     s.partial.emit(rid, ex.partial + f"\n\n⚠️ {ex.message}")
                     s.finished.emit(rid, False); return
-                errs.append(f"{name}: {ex.message}"); continue
+                errs.append(f"{name} (provider {i}/{n}): {ex.message}")
+                continue
             except Exception as ex:
-                errs.append(f"{name}: {str(ex)[:140]}"); continue
+                s.usage.err(p, str(ex)[:140])
+                errs.append(f"{name} (provider {i}/{n}): {str(ex)[:140]}")
+                continue
             finally:
                 slow.cancel(); slow2.cancel(); s.usage.tokens(p, usage)
+            if rid != s.req: return                     # a newer request replaced this one while it streamed
             if acc:
-                s.served.emit(rid, s.usage.served(p, list(dict.fromkeys(e.split(':')[0] for e in errs if not e.startswith('Speech')))))
+                s.served.emit(rid, s.usage.served(p, failed(), i, n))
                 if chunker and rid == s.req: chunker.feed(clean(acc), final=True)
-                s.partial.emit(rid, acc); s.finished.emit(rid, True); return
-            errs.append(f"{name}: empty response")
+                if streamed[0] != acc: s.partial.emit(rid, acc)      # do not deliver the same answer twice
+                s.finished.emit(rid, True); return
+            s.usage.err(p, "empty response")
+            errs.append(f"{name} (provider {i}/{n}): empty response")
         if rid != s.req: return
         s.partial.emit(rid, "⚠️ " + "\n\n".join(errs or ["No provider answered."])); s.finished.emit(rid, False)
 
@@ -994,7 +1022,7 @@ class Overlay(QWidget):
         GUI thread, which in turn delayed reading the next chunk from the socket."""
         if rid != s.req: return
         s.reply = txt
-        if s.state == "thinking": s.set_state("idle", "Answering…")
+        if s.state == "thinking": s.set_state("idle", getattr(s, "_answer_with", "") or "Answering…")
         if s._collapsed:                                                   # never hide the answer behind the orb
             if s.kind in BOARD_KINDS: return                               # the whiteboard presents it instead
             s.expand()
